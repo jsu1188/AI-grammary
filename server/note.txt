@@ -1,0 +1,48 @@
+'''
+fastapi             서버구축하는 프레임 워크(로그인 API, 회원가입 API, 교정 API)
+uvicorn             서버를 실제로 실행해주는 프로그램
+sqlalchemy          DB를 파이썬 코드로 다루게 해주는 ORM
+                    sql을 직접 덜 쓰고 파이썬 객체처럼 DB를 다룰 수 있게 해준다.
+passlib[bcrypt]     비밀번호를 해시해서 암호로 저장
+python-jose JWT     토큰을 만들고 해석하는 라이브러리
+                    로그인을 성공하면 서버가 토큰을 발급하고 이를 가지고 
+                    로그인을 했는지 확인 및 사용자 식별
+pydantic            입력값 검증
+openai              openAI API
+python-multipart    폼 데이터 처리용 라이브러리
+
+Base.metadata.tables["users"] = Table(
+    "user",
+    metadata,
+    ...
+)
+
+yield 값을 반환하고 다음 next() 호출이 있을 때까지 함수를 멈춘다.
+
+http 구조
+요청라인
+헤더
+헤더
+헤더
+빈 줄
+본문
+
+/login?data=~~ => login(data=)
+
+cesrv.hknu.ac.kr
+
+cd server
+uvicorn main:app --host 0.0.0.0 --port 8000
+서버실행
+
+py -m PyInstaller --onefile --windowed --name AIGrammaryClient main.py
+
+
+ipconfig
+netstat -ano | findstr :8000
+Get-NetTCPConnection -LocalPort 8000 -ErrorAction SilentlyContinue
+netsh interface ipv4 show excludedportrange protocol=tcp
+
+postgresql  키는 방법 : win+r => services.msc
+
+pgAdmin

@@ -1,0 +1,12 @@
+.auth_session.json
+.logs/
+
+__pycache__/
+*.pyc
+
+*.db
+
+server/.env
+
+*.bak_*
+checkword_backup_*/

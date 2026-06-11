@@ -1,0 +1,16 @@
+pyperclip
+openai
+PyQt5
+pynput
+uiautomation
+pywin32
+pywinauto
+psutil
+requests
+fastapi
+uvicorn
+sqlalchemy
+python-dotenv
+bcrypt
+python-jose
+pydantic
