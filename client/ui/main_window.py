@@ -388,6 +388,7 @@ class App:
         self.last_browser_extension_event_at = 0.0
         self.spell_check_in_progress = False
         self.spell_check_pending = False
+        self.pending_apply_correction = False
         self.spell_check_request_id = 0
         self.spell_check_debounce_ms = 2000
         self.spell_check_timer = QTimer()
@@ -434,6 +435,7 @@ class App:
         self.panel.tabs.currentChanged.connect(self.handle_tab_changed)
         self.panel.history_request_action_callback = self.handle_history_request_action
         self.panel.history_delete_callback = self.confirm_history_delete
+        self.panel.history_page_refresh_callback = lambda: self.show_history(0)
         self.panel.history_delete_all_btn.clicked.connect(self.confirm_delete_all_history_requests)
         self.panel.clipboard_mode_checkbox.toggled.connect(self.handle_live_input_mode_change)
         self.panel.realtime_mode_checkbox.toggled.connect(self.handle_live_input_mode_change)
@@ -578,6 +580,7 @@ class App:
         self.spell_check_timer.stop()
         self.spell_check_in_progress = False
         self.spell_check_pending = False
+        self.pending_apply_correction = False
         self.spell_check_request_id += 1
         self._set_live_reading_paused(False)
         self.panel.reset_text_tab()
@@ -671,6 +674,7 @@ class App:
 
         if result_data.get("error"):
             self.last_corrected_text = ""
+            self.pending_apply_correction = False
             self.panel.set_spell_result(f"OpenAI 맞춤법 요청 실패:\n\n{result_data.get('error')}")
             self.update_correction_overlay()
             if self.spell_check_pending:
@@ -691,6 +695,9 @@ class App:
             output_text=self.last_corrected_text,
             spelling_feedback=spelling_feedback,
         )
+        if self.pending_apply_correction and self._can_apply_source_correction():
+            self.pending_apply_correction = False
+            self._apply_correction_text(self.last_corrected_text)
         if self.spell_check_pending:
             self.spell_check_pending = False
             self.schedule_spell_check()
@@ -734,7 +741,14 @@ class App:
     def apply_correction_to_source(self):
         if not self._can_apply_source_correction():
             return
-        text = self.last_corrected_text or self._extract_corrected_text(self.panel.spell_box.toPlainText())
+        if self.spell_check_in_progress or not str(self.last_corrected_text or "").strip():
+            self.pending_apply_correction = True
+            self.panel.set_spell_result("교정된 텍스트를 기다리는 중입니다...\n\n결과가 도착하면 자동으로 원본 수정이 진행됩니다.")
+            return
+        self.pending_apply_correction = False
+        self._apply_correction_text(self.last_corrected_text)
+
+    def _apply_correction_text(self, text):
         if not text:
             self.panel.set_spell_result("수정할 맞춤법 검사 결과가 없습니다.")
             return
@@ -826,16 +840,26 @@ class App:
             return {"status": "skipped", "reason": "unsupported_mode"}
         style_info = target.style_info or {}
         if target.mode == "hwp":
-            if not style_info.get("selection_mode"):
-                return {"status": "skipped", "reason": "hwp_full_document_apply_handles_style"}
-            prepared_style_info = self.get_output_applier().prepare_hwp_selection_style_runs(
-                target,
-                str(style_info.get("selection_text") or self.last_correction_source_text or self.last_input or ""),
-            )
+            if style_info.get("selection_mode"):
+                prepared_style_info = self.get_output_applier().prepare_hwp_selection_style_runs(
+                    target,
+                    str(style_info.get("selection_text") or self.last_correction_source_text or self.last_input or ""),
+                )
+            else:
+                prepared_style_info = self.get_output_applier().prepare_hwp_full_document_style_runs(
+                    target,
+                    str(style_info.get("_source_text") or self.last_correction_source_text or self.last_input or ""),
+                )
             if prepared_style_info:
                 target.style_info = dict(prepared_style_info)
                 style_info = target.style_info
-        source_text = str(style_info.get("selection_text") or self.last_correction_source_text or self.last_input or "")
+        source_text = str(
+            style_info.get("selection_text")
+            or style_info.get("_source_text")
+            or self.last_correction_source_text
+            or self.last_input
+            or ""
+        )
         if not source_text.strip() or not str(corrected_text or "").strip():
             return {"status": "skipped", "reason": "source_or_corrected_empty"}
         style_runs = style_info.get("segments") or []

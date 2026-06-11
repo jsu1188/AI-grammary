@@ -131,6 +131,32 @@ class OutputApplier:
             self._log_hwp_replace(f"HWP pre-map segments failed: {type(exc).__name__}: {exc}")
             return style_info
 
+    def prepare_hwp_full_document_style_runs(self, target: OutputTarget | None, source_text: str) -> dict:
+        style_info = dict((target.style_info or {}) if target else {})
+        if not target or target.mode != "hwp":
+            return style_info
+        if style_info.get("selection_mode"):
+            return style_info
+        if style_info.get("segments"):
+            return style_info
+        try:
+            hwp = self._active_hwp_object(target.window_handle)
+            if hwp is None:
+                return style_info
+            self._diagnose_hwp_textfile_formats(hwp)
+            segments = self._capture_hwp_style_segments_from_hwpml2x(hwp, expected_text="")
+            if not segments:
+                segments = self._capture_hwp_style_segments(hwp, str(source_text or ""))
+            if segments:
+                style_info["segments"] = segments
+                self._log_hwp_replace(
+                    f"HWP full pre-map segments prepared count={len(segments)}"
+                )
+            return style_info
+        except Exception as exc:
+            self._log_hwp_replace(f"HWP full pre-map segments failed: {type(exc).__name__}: {exc}")
+            return style_info
+
     def remap_hwp_selection_segments(self, style_info: dict, source_text: str, corrected_text: str) -> list[dict]:
         base_segments = list((style_info or {}).get("segments") or [])
         if not base_segments:
@@ -187,7 +213,11 @@ class OutputApplier:
             self._focus_window(target.window_handle)
             if (target.style_info or {}).get("selection_mode"):
                 preserve_style = bool((target.style_info or {}).get("segments_mapped") or (target.style_info or {}).get("segments"))
+                has_mapped_segments = bool((target.style_info or {}).get("segments_mapped") and (target.style_info or {}).get("segments"))
                 if (target.style_info or {}).get("hwp_selection_start_pos"):
+                    self._apply_to_active_hwp(text, target.style_info, target.window_handle)
+                    return
+                if has_mapped_segments:
                     self._apply_to_active_hwp(text, target.style_info, target.window_handle)
                     return
                 if preserve_style:
@@ -742,7 +772,12 @@ class OutputApplier:
             return
         source_text = str(style_info.get("_source_text") or "")
         if source_text and text:
-            if self._apply_hwp_full_document_via_selection_mode(hwp, source_text, text):
+            if self._apply_hwp_full_document_via_selection_mode(
+                hwp,
+                source_text,
+                text,
+                style_info.get("segments") if style_info.get("segments_mapped") else None,
+            ):
                 return
         if not source_hwpml2x:
             source_hwpml2x = self._get_hwp_textfile(hwp, "HWPML2X", "")
@@ -1381,7 +1416,13 @@ class OutputApplier:
         else:
             self._log_hwp_replace("HWP selection style restore skipped by safety guard")
 
-    def _apply_hwp_full_document_via_selection_mode(self, hwp, source_text: str, replacement_text: str) -> bool:
+    def _apply_hwp_full_document_via_selection_mode(
+        self,
+        hwp,
+        source_text: str,
+        replacement_text: str,
+        mapped_segments: list[dict] | None = None,
+    ) -> bool:
         try:
             hwp.MovePos(2)
             hwp.Run("SelectAll")
@@ -1389,21 +1430,23 @@ class OutputApplier:
             self._log_hwp_replace(f"HWP full-as-selection SelectAll failed: {type(exc).__name__}: {exc}")
             return False
 
-        segments = self._capture_hwp_style_segments_from_hwpml2x(hwp, expected_text="")
-        if not segments:
-            segments = self._capture_hwp_style_segments(hwp, source_text)
-        if not segments:
-            self._log_hwp_replace("HWP full-as-selection skipped: no style segments")
-            return False
-
-        mapped_segments = self._remap_style_segments(source_text, replacement_text, segments)
-        if not mapped_segments:
-            self._log_hwp_replace("HWP full-as-selection skipped: remap failed")
-            return False
+        base_segments = []
+        effective_mapped_segments = list(mapped_segments or [])
+        if not effective_mapped_segments:
+            base_segments = self._capture_hwp_style_segments_from_hwpml2x(hwp, expected_text="")
+            if not base_segments:
+                base_segments = self._capture_hwp_style_segments(hwp, source_text)
+            if not base_segments:
+                self._log_hwp_replace("HWP full-as-selection skipped: no style segments")
+                return False
+            effective_mapped_segments = self._remap_style_segments(source_text, replacement_text, base_segments)
+            if not effective_mapped_segments:
+                self._log_hwp_replace("HWP full-as-selection skipped: remap failed")
+                return False
 
         style_info = {
             "selection_mode": True,
-            "segments": mapped_segments,
+            "segments": effective_mapped_segments,
             "segments_mapped": True,
             "selection_text": source_text,
             "_source_text": source_text,
@@ -1412,7 +1455,8 @@ class OutputApplier:
         self._log_hwp_replace(
             "HWP full document using selection-mode RTF "
             f"source_len={len(source_text)} replacement_len={len(replacement_text)} "
-            f"segments={len(segments)} mapped={len(mapped_segments)}"
+            f"segments={len(base_segments) if base_segments else len(effective_mapped_segments)} "
+            f"mapped={len(effective_mapped_segments)}"
         )
         self._apply_hwp_saved_selection_replacement(hwp, replacement_text, style_info)
         return True

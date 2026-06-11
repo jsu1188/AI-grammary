@@ -1849,7 +1849,10 @@ class ResultPanel(QWidget):
             self.replace_mode_checkbox.setChecked(getattr(self, "saved_replace_mode", False))
             self._sync_history_setting_access()
             self.settings_scroll_area.verticalScrollBar().setValue(0)
-        self.content_stack.setCurrentIndex(0 if showing_settings else 1)
+        if showing_settings:
+            self._restore_after_settings_close()
+        else:
+            self.content_stack.setCurrentIndex(1)
         self.settings_btn.setChecked(not showing_settings)
 
     def close_settings_page(self):
@@ -1858,8 +1861,23 @@ class ResultPanel(QWidget):
         self.set_input_mode(self.saved_input_mode)
         self.replace_mode_checkbox.setChecked(getattr(self, "saved_replace_mode", False))
         self._sync_history_setting_access()
-        self.content_stack.setCurrentIndex(0)
+        self._restore_after_settings_close()
         self.settings_btn.setChecked(False)
+
+    def _restore_after_settings_close(self):
+        history_tab_index = getattr(self, "history_tab_index", -1)
+        if self.tabs.currentIndex() == history_tab_index:
+            callback = getattr(self, "history_page_refresh_callback", None)
+            if callable(callback):
+                callback()
+                return
+            if getattr(self, "_last_history_logs", None) is not None:
+                self.show_history_list(
+                    getattr(self, "_history_feature_type", 0),
+                    getattr(self, "_last_history_logs", []),
+                )
+                return
+        self.content_stack.setCurrentIndex(0)
 
     def show_settings_saved_notice(self):
         self.settings_notice_timer.stop()
