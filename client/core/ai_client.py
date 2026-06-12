@@ -4,11 +4,12 @@ from pathlib import Path
 
 import requests
 
+from client.config import REMOTE_SERVER_URL
 from client.core.local_server import LocalServer
 
 
 class AIClient:
-    def __init__(self, base_url="http://127.0.0.1:18766"):
+    def __init__(self, base_url=REMOTE_SERVER_URL):
         self.base_url = base_url.rstrip("/")
         self.local_server = LocalServer(base_url=self.base_url)
         self._supports_style_map = None

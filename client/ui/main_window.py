@@ -3,6 +3,7 @@ import sys
 import threading
 import time
 import copy
+from html import escape
 from datetime import datetime
 from pathlib import Path
 
@@ -22,7 +23,7 @@ except Exception:  # pragma: no cover - optional Windows dependency
     win32con = None
 
 from client.app_settings import DEFAULT_SETTINGS, load_app_settings, save_app_settings
-from client.config import APP_VERSION
+from client.config import APP_VERSION, DEFAULT_UPDATE_URL
 from client.core.auth_api_client import AuthAPIClient, UnauthorizedError
 from client.core.analyzer import TextAnalyzer
 from client.core.line_structure import preserve_replacement_structure
@@ -446,6 +447,7 @@ class App:
         self.current_history_source_text = ""
         self.update_info = None
         self.update_notice_shown = False
+        self.last_notified_update_version = ""
         self.last_output_target = None
         self.suppress_replacement_echo_until = 0.0
         self.suppress_replacement_echo_text = ""
@@ -459,6 +461,9 @@ class App:
         self.spell_check_timer = QTimer()
         self.spell_check_timer.setSingleShot(True)
         self.spell_check_timer.timeout.connect(self.run_spell_check)
+        self.update_check_timer = QTimer()
+        self.update_check_timer.setInterval(600000)
+        self.update_check_timer.timeout.connect(self.start_update_check)
         self.active_input_mode = self.settings.get("input_mode", "clipboard")
         self.clipboard_thread = None
         self.realtime_thread = None
@@ -515,6 +520,7 @@ class App:
         self.update_login_state()
         QTimer.singleShot(0, self.start_restored_login_sync)
         QTimer.singleShot(200, self.start_update_check)
+        self.update_check_timer.start()
 
     def initialize_auth(self):
         self.api_client.try_restore_session()
@@ -592,14 +598,18 @@ class App:
             return
 
         self.update_info = result
+        if not str(self.update_info.get("download_url", "") or "").strip():
+            self.update_info["download_url"] = DEFAULT_UPDATE_URL
+        latest_version = str(self.update_info.get("latest_version", "") or "").strip()
         self.panel.set_update_available(
             True,
-            latest_version=result.get("latest_version", ""),
+            latest_version=latest_version,
             message=result.get("message", ""),
-            download_url=result.get("download_url", ""),
+            download_url=self.update_info.get("download_url", ""),
         )
-        if not self.update_notice_shown:
+        if latest_version and self.last_notified_update_version != latest_version:
             self.update_notice_shown = True
+            self.last_notified_update_version = latest_version
             self.show_update_notice()
 
     def show_update_notice(self):
@@ -608,15 +618,17 @@ class App:
         latest_version = str(self.update_info.get("latest_version", "") or "").strip()
         current_version = str(self.update_info.get("current_version", APP_VERSION) or APP_VERSION).strip()
         notice_text = self.panel.get_update_notice_text()
-        lines = [
-            f"현재 버전: {current_version}",
-        ]
+        lines = [escape(f"현재 버전: {current_version}")]
         if latest_version:
-            lines.append(f"최신 버전: {latest_version}")
+            lines.append(escape(f"최신 버전: {latest_version}"))
         if notice_text:
-            lines.append("")
-            lines.append(notice_text)
-        self.panel.show_notice("업데이트 알림", "\n".join(lines).strip())
+            for line in str(notice_text).splitlines():
+                lines.append(escape(line))
+        safe_url = escape(DEFAULT_UPDATE_URL, quote=True)
+        lines.append("")
+        lines.append(f'<a href="{safe_url}">버전업하러가기</a>')
+        html_message = "<br>".join(lines).strip()
+        self.panel.show_notice_rich("업데이트 알림", html_message)
 
     def _is_version_newer(self, latest_version, current_version):
         return self._version_key(latest_version) > self._version_key(current_version)

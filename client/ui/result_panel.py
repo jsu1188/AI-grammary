@@ -1,8 +1,8 @@
 ﻿from pathlib import Path
 from datetime import datetime, timezone
 
-from PyQt5.QtCore import QPoint, QRectF, QSize, Qt, QVariantAnimation, QTimer
-from PyQt5.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from PyQt5.QtCore import QPoint, QRectF, QSize, Qt, QVariantAnimation, QTimer, QUrl
+from PyQt5.QtGui import QColor, QDesktopServices, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -216,8 +216,8 @@ class ResultPanel(QWidget):
         self.hide_btn.setObjectName("ghostButton")
         self.hide_btn.clicked.connect(self.hide)
 
-        header_layout.addWidget(self.header_history_btn)
         header_layout.addWidget(self.header_update_btn)
+        header_layout.addWidget(self.header_history_btn)
         header_layout.addWidget(self.login_btn)
         header_layout.addWidget(self.settings_btn)
         header_layout.addWidget(self.hide_btn)
@@ -667,6 +667,8 @@ class ResultPanel(QWidget):
         self.prompt_message_label = QLabel("")
         self.prompt_message_label.setObjectName("promptMessage")
         self.prompt_message_label.setWordWrap(True)
+        self.prompt_message_label.setOpenExternalLinks(False)
+        self.prompt_message_label.linkActivated.connect(self._open_external_link)
         panel_layout.addWidget(self.prompt_title_label)
         panel_layout.addWidget(self.prompt_message_label, 1)
 
@@ -1171,6 +1173,8 @@ class ResultPanel(QWidget):
     ):
         self._return_stack_index = self.content_stack.currentIndex()
         self.prompt_title_label.setText(title)
+        self.prompt_message_label.setTextFormat(Qt.PlainText)
+        self.prompt_message_label.setOpenExternalLinks(False)
         self.prompt_message_label.setText(message)
         self._disconnect_prompt_buttons()
         self.prompt_no_btn.show()
@@ -1184,13 +1188,38 @@ class ResultPanel(QWidget):
     def show_notice(self, title, message):
         self._return_stack_index = self.content_stack.currentIndex()
         self.prompt_title_label.setText(title)
+        self.prompt_message_label.setTextFormat(Qt.PlainText)
+        self.prompt_message_label.setOpenExternalLinks(False)
         self.prompt_message_label.setText(message)
         self._disconnect_prompt_buttons()
         self.prompt_no_btn.hide()
         self.prompt_yes_btn.setText("확인")
+        self.prompt_no_btn.setText("아니오")
         self.prompt_yes_btn.clicked.connect(lambda: self._resolve_prompt(None))
         self.content_stack.setCurrentIndex(4)
         self.settings_btn.setChecked(False)
+
+    def show_notice_rich(self, title, html_message):
+        self._return_stack_index = self.content_stack.currentIndex()
+        self.prompt_title_label.setText(title)
+        self.prompt_message_label.setTextFormat(Qt.RichText)
+        self.prompt_message_label.setOpenExternalLinks(False)
+        self.prompt_message_label.setText(html_message)
+        self._disconnect_prompt_buttons()
+        self.prompt_no_btn.hide()
+        self.prompt_yes_btn.setText("확인")
+        self.prompt_no_btn.setText("아니오")
+        self.prompt_yes_btn.clicked.connect(lambda: self._resolve_prompt(None))
+        self.content_stack.setCurrentIndex(4)
+        self.settings_btn.setChecked(False)
+
+    def _open_external_link(self, url):
+        try:
+            target = QUrl(str(url or "").strip())
+            if target.isValid():
+                QDesktopServices.openUrl(target)
+        except Exception:
+            pass
 
     def _resolve_prompt(self, callback):
         self.prompt_no_btn.show()
@@ -2236,12 +2265,9 @@ class ResultPanel(QWidget):
 
     def get_update_notice_text(self):
         message = getattr(self, "_update_message", "")
-        download_url = getattr(self, "_update_download_url", "")
         lines = []
         if message:
             lines.append(message)
-        if download_url:
-            lines.append(f"다운로드 주소: {download_url}")
         return "\n".join(line for line in lines if line).strip()
 
     def clear_spell_result(self):
