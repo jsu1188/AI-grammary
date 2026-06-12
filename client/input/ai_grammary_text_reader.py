@@ -374,6 +374,7 @@ class BrowserReader(BasePollingReader):
         super().__init__(debug=debug)
         self.desktop = None
         self.uia = None
+        self._last_browser_hwnd = 0
         self._init_backend()
 
     def _init_backend(self):
@@ -468,10 +469,68 @@ class BrowserReader(BasePollingReader):
     def _best_input_text(self, window) -> str:
         if window is None:
             return ""
+        for source, wrapper in self._browser_candidates(window, include_descendants=False):
+            try:
+                control_type = wrapper.element_info.control_type or ""
+                title = wrapper.window_text() or ""
+            except Exception:
+                control_type = ""
+                title = ""
+            text = self._extract_text(wrapper)
+            self._debug(f"browser candidate={source} type={control_type!r} title={title!r} len={len(text)}")
+            if control_type not in INPUT_CONTROL_TYPES or not has_text_content(text):
+                continue
+            lowered = f"{title}\n{text}".lower()
+            if looks_like_url(text) or any(hint in lowered for hint in ("address", "search google", "url", "\uc8fc\uc18c")):
+                continue
+            return text
+        return ""
+
+    def read_current_text(self) -> str:
+        hwnd = get_foreground_hwnd()
+        if not self._is_browser(hwnd):
+            return ""
+        self._last_browser_hwnd = int(hwnd)
+        return self._best_input_text(self._window_wrapper(hwnd))
+
+    def read_selected_text(self) -> str:
+        hwnd = get_foreground_hwnd()
+        if not self._is_browser(hwnd):
+            hwnd = self._last_browser_hwnd if self._is_browser(self._last_browser_hwnd) else 0
+        if not hwnd:
+            return ""
+        window = self._window_wrapper(hwnd)
+        text = self._best_selected_input_text(window).strip()
+        if not has_text_content(text):
+            text = self._read_selected_text_via_clipboard(hwnd).strip()
+        if not has_text_content(text):
+            self._last_selection_info = {}
+            return ""
+        self._last_selection_info = {
+            "selection_mode": True,
+            "selection_text": text,
+        }
+        return text
+
+    def _best_selected_input_text(self, window) -> str:
+        if window is None:
+            return ""
+        for source, wrapper in self._browser_candidates(window, include_descendants=True):
+            try:
+                control_type = wrapper.element_info.control_type or ""
+            except Exception:
+                control_type = ""
+            text = self._extract_selected_text(wrapper)
+            self._debug(f"browser selected candidate={source} type={control_type!r} len={len(text)}")
+            if has_text_content(text):
+                return text
+        return ""
+
+    def _browser_candidates(self, window, include_descendants: bool = False):
         candidates = []
-        focused = self._focused_wrapper()
-        if focused is not None:
-            candidates.append(("focused-uia", focused))
+        focused_uia = self._focused_wrapper()
+        if focused_uia is not None:
+            candidates.append(("focused-uia", focused_uia))
         try:
             focused = window.get_focus()
         except Exception:
@@ -487,34 +546,106 @@ class BrowserReader(BasePollingReader):
             if current is not None:
                 candidates.append((f"focused-parent-{depth + 1}", current))
 
+        if include_descendants:
+            expanded = list(candidates)
+            for source, wrapper in list(candidates):
+                try:
+                    descendants = wrapper.descendants()
+                except Exception:
+                    descendants = []
+                for index, child in enumerate(descendants[:60]):
+                    expanded.append((f"{source}-child-{index}", child))
+            try:
+                window_descendants = window.descendants()
+            except Exception:
+                window_descendants = []
+            for index, child in enumerate(window_descendants[:80]):
+                expanded.append((f"window-child-{index}", child))
+            candidates = expanded
+
         seen = set()
+        unique_candidates = []
         for source, wrapper in candidates:
             try:
-                key = (getattr(wrapper, "handle", None), wrapper.element_info.control_type, wrapper.window_text())
-                control_type = wrapper.element_info.control_type or ""
-                title = wrapper.window_text() or ""
+                key = (
+                    getattr(wrapper, "handle", None),
+                    getattr(wrapper.element_info, "control_type", ""),
+                    wrapper.window_text(),
+                )
             except Exception:
                 key = id(wrapper)
-                control_type = ""
-                title = ""
             if key in seen:
                 continue
             seen.add(key)
-            text = self._extract_text(wrapper)
-            self._debug(f"browser candidate={source} type={control_type!r} title={title!r} len={len(text)}")
-            if control_type not in INPUT_CONTROL_TYPES or not has_text_content(text):
-                continue
-            lowered = f"{title}\n{text}".lower()
-            if looks_like_url(text) or any(hint in lowered for hint in ("address", "search google", "url", "\uc8fc\uc18c")):
-                continue
-            return text
+            unique_candidates.append((source, wrapper))
+        return unique_candidates
+
+    def _extract_selected_text(self, wrapper) -> str:
+        if wrapper is None:
+            return ""
+        try:
+            iface_text = getattr(wrapper, "iface_text", None)
+            if iface_text:
+                selected_ranges = iface_text.GetSelection()
+                chunks: list[str] = []
+                for text_range in selected_ranges or []:
+                    try:
+                        chunk = normalize_text(text_range.GetText(-1))
+                    except Exception:
+                        chunk = ""
+                    if has_text_content(chunk):
+                        chunks.append(chunk)
+                if chunks:
+                    return "".join(chunks)
+        except Exception:
+            pass
+        try:
+            legacy = wrapper.legacy_properties() if hasattr(wrapper, "legacy_properties") else {}
+            selected_text = normalize_text(str(legacy.get("Selection", "") or ""))
+            if has_text_content(selected_text):
+                return selected_text
+        except Exception:
+            pass
         return ""
 
-    def read_current_text(self) -> str:
-        hwnd = get_foreground_hwnd()
+    def _read_selected_text_via_clipboard(self, hwnd: int) -> str:
+        if pyperclip is None or win32api is None or win32con is None or win32gui is None:
+            return ""
         if not self._is_browser(hwnd):
             return ""
-        return self._best_input_text(self._window_wrapper(hwnd))
+        sentinel = f"__AI_GRAMMARY_BROWSER_SELECTION_{time.monotonic_ns()}__"
+        try:
+            previous_clipboard = pyperclip.paste()
+        except Exception:
+            previous_clipboard = None
+        try:
+            if get_foreground_hwnd() != hwnd:
+                return ""
+            pyperclip.copy(sentinel)
+            self._send_ctrl_c()
+            time.sleep(0.08)
+            copied = normalize_text(pyperclip.paste()).strip()
+            if not copied or copied == sentinel or "AI_GRAMMARY_BROWSER_SELECTION_" in copied:
+                return ""
+            return copied
+        except Exception as exc:
+            self._debug(f"browser selection clipboard read failed: {exc}")
+            return ""
+        finally:
+            if previous_clipboard is not None:
+                try:
+                    pyperclip.copy(previous_clipboard)
+                except Exception:
+                    pass
+
+    def _send_ctrl_c(self):
+        ctrl = getattr(win32con, "VK_CONTROL", 0x11)
+        key_c = ord("C")
+        keyup = getattr(win32con, "KEYEVENTF_KEYUP", 0x0002)
+        win32api.keybd_event(ctrl, 0, 0, 0)
+        win32api.keybd_event(key_c, 0, 0, 0)
+        win32api.keybd_event(key_c, 0, keyup, 0)
+        win32api.keybd_event(ctrl, 0, keyup, 0)
 
 
 class ActiveWordReader(BasePollingReader):
@@ -2345,11 +2476,21 @@ class UniversalActiveTextReader:
 
         hwnd = get_foreground_hwnd()
         if self._is_own_window(hwnd):
-            return None
+            browser_reader = self.readers.get("browser")
+            browser_hwnd = int(getattr(browser_reader, "_last_browser_hwnd", 0) or 0)
+            if selection_only and browser_hwnd and get_process_name(browser_hwnd) in BROWSER_PROCESS_NAMES:
+                hwnd = browser_hwnd
+            else:
+                return None
 
         window_title = get_window_title(hwnd)
         process_name = get_process_name(hwnd)
-        for reader_name, reader in self._reader_order_for_foreground():
+        reader_order = (
+            [("browser", self.readers["browser"])]
+            if selection_only and process_name in BROWSER_PROCESS_NAMES
+            else self._reader_order_for_foreground()
+        )
+        for reader_name, reader in reader_order:
             text = normalize_text(reader.read_selected_text() if selection_only else reader.read_current_text())
             if not has_text_content(text):
                 continue

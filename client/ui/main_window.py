@@ -1207,7 +1207,6 @@ class App:
         if not self.last_input:
             return
         if self.spell_check_in_progress:
-            self.spell_check_pending = True
             return
         self.spell_check_timer.start(self.spell_check_debounce_ms)
 
@@ -1216,7 +1215,6 @@ class App:
             return
         self.spell_check_timer.stop()
         if self.spell_check_in_progress:
-            self.spell_check_pending = True
             return
         source_text = self.last_input
         self.spell_check_request_id += 1
@@ -1229,7 +1227,6 @@ class App:
         self._begin_word_overlay_spelling_snapshot(source_text)
         self.panel.set_spell_result("OpenAI 맞춤법 요청 중입니다...")
         self.update_correction_overlay()
-        self._set_live_reading_paused(True)
 
         worker = threading.Thread(
             target=self._run_spell_check_worker,
@@ -1263,12 +1260,10 @@ class App:
         if result_data.get("request_id") != self.spell_check_request_id:
             return
         self.spell_check_in_progress = False
-        self._set_live_reading_paused(False)
 
         source_text = result_data.get("source_text", "")
         if source_text != self.last_input:
             self.spell_check_pending = False
-            self.schedule_spell_check()
             return
 
         if result_data.get("error"):
@@ -1276,9 +1271,6 @@ class App:
             self.pending_apply_correction = False
             self.panel.set_spell_result(f"OpenAI 맞춤법 요청 실패:\n\n{result_data.get('error')}")
             self.update_correction_overlay()
-            if self.spell_check_pending:
-                self.spell_check_pending = False
-                self.schedule_spell_check()
             return
 
         spelling_payload = result_data.get("payload") or {}
@@ -1301,9 +1293,6 @@ class App:
         if self.pending_apply_correction and self._can_apply_source_correction():
             self.pending_apply_correction = False
             self._apply_correction_text(self.last_corrected_text)
-        if self.spell_check_pending:
-            self.spell_check_pending = False
-            self.schedule_spell_check()
 
     def _set_live_reading_paused(self, paused: bool):
         try:

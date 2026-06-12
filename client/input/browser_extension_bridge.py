@@ -33,6 +33,7 @@ class BrowserExtensionBridge:
     _capture_count: int = 0
     _command_poll_count: int = 0
     _last_command_poll_log: float = 0.0
+    _analyzer: Any | None = None
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -67,6 +68,10 @@ class BrowserExtensionBridge:
                     payload = self._read_json()
                     bridge.record_applied(payload)
                     self._send_json({"ok": True})
+                    return
+                if parsed.path == "/correct":
+                    payload = self._read_json()
+                    self._send_json(bridge.correct_text(str(payload.get("text") or "")))
                     return
                 self._send_json({"error": "not_found"}, status=404)
 
@@ -110,6 +115,14 @@ class BrowserExtensionBridge:
     def record_capture(self, payload: dict[str, Any]) -> dict[str, Any] | None:
         text = str(payload.get("text") or "")
         if not text.strip():
+            return None
+        target_kind = str(payload.get("target_kind") or "")
+        if target_kind not in {"contenteditable", "textarea", "input"}:
+            self._log(
+                "capture_rejected "
+                f"kind={target_kind!r} title={str(payload.get('title') or '')[:80]!r} "
+                f"text_len={len(text)}"
+            )
             return None
         session_id = str(payload.get("session_id") or "")
         dom_debug = payload.get("dom_debug") or {}
@@ -165,6 +178,61 @@ class BrowserExtensionBridge:
             f"dom={self._dom_debug_sample(event['style_info'].get('dom_debug') or {})!r}"
         )
         return event
+
+    def correct_text(self, text: str) -> dict[str, Any]:
+        source_text = str(text or "")
+        if not source_text.strip():
+            return {"ok": False, "error": "교정할 텍스트가 없습니다.", "corrected": "", "issues": ""}
+        try:
+            analyzer = self._get_analyzer()
+            result = analyzer.check_spelling(source_text)
+            if isinstance(result, dict):
+                corrected = str(result.get("corrected") or source_text)
+                issues = str(result.get("issues") or "")
+            else:
+                corrected = str(result or source_text)
+                issues = ""
+            return {"ok": True, "corrected": corrected, "issues": issues, "source": "desktop"}
+        except Exception as exc:
+            corrected = self._dummy_correct(source_text)
+            return {
+                "ok": True,
+                "corrected": corrected,
+                "issues": f"데스크톱 교정 호출 실패로 더미 교정을 사용했습니다. {type(exc).__name__}: {exc}",
+                "source": "dummy",
+            }
+
+    def _get_analyzer(self):
+        if self._analyzer is None:
+            from client.app_settings import load_app_settings
+            from client.core.analyzer import TextAnalyzer
+
+            settings = load_app_settings()
+            self._analyzer = TextAnalyzer(api_enabled=bool(settings.get("api_enabled", True)))
+        return self._analyzer
+
+    def reload_analyzer(self, api_enabled: bool = True):
+        from client.core.analyzer import TextAnalyzer
+
+        self._analyzer = TextAnalyzer(api_enabled=api_enabled)
+        self._analyzer.reload_api(api_enabled=api_enabled)
+        self._log(f"reload_analyzer api_enabled={bool(api_enabled)!r} available={self._analyzer.ai.is_available!r}")
+        return self._analyzer
+
+    def _dummy_correct(self, text: str) -> str:
+        corrected = str(text or "")
+        replacements = {
+            "안됀": "안 된",
+            "안되": "안 돼",
+            "됬": "됐",
+            "되요": "돼요",
+            "왠만": "웬만",
+            "어의": "어이",
+            "맞춤뻡": "맞춤법",
+        }
+        for wrong, right in replacements.items():
+            corrected = corrected.replace(wrong, right)
+        return corrected
 
     def _restore_session_blank_lines(self, session_id: str, previous_text: str, current_text: str) -> str:
         if not previous_text:
@@ -280,7 +348,10 @@ class BrowserExtensionBridge:
                     "fontWeight": style.get("fontWeight"),
                     "fontStyle": style.get("fontStyle"),
                     "color": style.get("color"),
+                    "webkitTextFillColor": style.get("webkitTextFillColor"),
+                    "verticalAlign": style.get("verticalAlign"),
                     "textDecorationLine": style.get("textDecorationLine"),
+                    "backgroundColor": style.get("backgroundColor"),
                 }
             )
         return sample
@@ -298,7 +369,10 @@ class BrowserExtensionBridge:
                     "fontWeight": style.get("fontWeight"),
                     "fontStyle": style.get("fontStyle"),
                     "color": style.get("color"),
+                    "webkitTextFillColor": style.get("webkitTextFillColor"),
+                    "verticalAlign": style.get("verticalAlign"),
                     "textDecorationLine": style.get("textDecorationLine"),
+                    "backgroundColor": style.get("backgroundColor"),
                 }
             )
         return {

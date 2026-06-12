@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Writing Assistant</title>
+    <style>
+      body {
+        width: 360px;
+        margin: 0;
+        padding: 14px;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: #2f241f;
+        background: #fffaf4;
+      }
+
+      h1 {
+        margin: 0 0 10px;
+        font-size: 16px;
+      }
+
+      .status {
+        min-height: 18px;
+        margin-bottom: 10px;
+        color: #7b6658;
+        font-size: 12px;
+      }
+
+      textarea {
+        box-sizing: border-box;
+        width: 100%;
+        min-height: 96px;
+        resize: vertical;
+        border: 1px solid #dccbbb;
+        border-radius: 8px;
+        padding: 10px;
+        color: #2f241f;
+        background: #ffffff;
+        font-size: 13px;
+        line-height: 1.45;
+      }
+
+      .label {
+        margin: 12px 0 6px;
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .actions {
+        display: flex;
+        gap: 8px;
+        margin-top: 10px;
+      }
+
+      button {
+        border: 0;
+        border-radius: 8px;
+        padding: 9px 11px;
+        color: #3f2f26;
+        background: #e8d4bf;
+        font-size: 12px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+
+      button.primary {
+        color: #fff8f2;
+        background: #b86a3c;
+      }
+
+      button:disabled {
+        opacity: 0.55;
+        cursor: default;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Writing Assistant</h1>
+    <div id="status" class="status">Click a web text field, then press Load.</div>
+
+    <div class="label">Source text</div>
+    <textarea id="sourceText" placeholder="Focused field text appears here."></textarea>
+
+    <div class="actions">
+      <button id="loadBtn">Load</button>
+      <button id="correctBtn" class="primary">Correct</button>
+    </div>
+
+    <div class="label">Correction result</div>
+    <textarea id="resultText" placeholder="Correction result appears here."></textarea>
+
+    <div class="actions">
+      <button id="copyBtn">Copy</button>
+      <button id="applyBtn">Apply</button>
+    </div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

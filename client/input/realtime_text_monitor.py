@@ -2,6 +2,7 @@
 from pathlib import Path
 
 from client.input.ai_grammary_text_reader import (
+    BROWSER_PROCESS_NAMES,
     HWP_PROCESS_NAMES,
     UniversalActiveTextReader,
     WORD_PROCESS_NAMES,
@@ -65,9 +66,10 @@ def monitor_realtime_text(callback, poll_interval=0.25, debug=False, get_active_
 
             browser_event = browser_bridge.poll_event()
             if browser_event is not None:
-                callback(browser_event)
-                time.sleep(loop_sleep)
-                continue
+                if _should_use_browser_bridge_event(browser_event, active_mode):
+                    callback(browser_event)
+                    time.sleep(loop_sleep)
+                    continue
 
             if input_pause.should_skip_poll():
                 time.sleep(loop_sleep)
@@ -163,6 +165,24 @@ def set_polling_paused(paused: bool):
 
 def is_poll_temporarily_paused() -> bool:
     return _EXTERNAL_POLL_PAUSED or time.monotonic() < _EXTERNAL_POLL_PAUSE_UNTIL
+
+
+def _should_use_browser_bridge_event(event: dict, active_mode: str) -> bool:
+    if not isinstance(event, dict):
+        return False
+    source = event.get("source")
+    if active_mode == "selection":
+        return source == "selection" and _is_foreground_browser()
+    if source != "realtime":
+        return False
+    return _is_foreground_browser()
+
+
+def _is_foreground_browser() -> bool:
+    try:
+        return get_process_name(get_foreground_hwnd()) in BROWSER_PROCESS_NAMES
+    except Exception:
+        return False
 
 
 def _typed_text_event(text):
