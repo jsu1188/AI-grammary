@@ -187,6 +187,11 @@ class ResultPanel(QWidget):
         header_layout.addStretch()
 
         self.header_history_btn = self._create_history_button()
+        self.header_update_btn = QPushButton("버전 UP")
+        self.header_update_btn.setObjectName("updateBadgeButton")
+        self.header_update_btn.setFixedHeight(40)
+        self.header_update_btn.setToolTip("새 버전 알림")
+        self.header_update_btn.hide()
 
         self.login_btn = QPushButton("로그인")
         self.login_btn.setObjectName("secondaryButton")
@@ -212,6 +217,7 @@ class ResultPanel(QWidget):
         self.hide_btn.clicked.connect(self.hide)
 
         header_layout.addWidget(self.header_history_btn)
+        header_layout.addWidget(self.header_update_btn)
         header_layout.addWidget(self.login_btn)
         header_layout.addWidget(self.settings_btn)
         header_layout.addWidget(self.hide_btn)
@@ -1782,6 +1788,17 @@ class ResultPanel(QWidget):
             QPushButton#iconButton[loginRequired="true"]:hover {{
                 background: #cfcfcf;
             }}
+            QPushButton#updateBadgeButton {{
+                background: {colors["accent"]};
+                color: {colors["accent_text"]};
+                padding: 0px 16px;
+                border-radius: 14px;
+                font-size: 12px;
+                font-weight: 800;
+            }}
+            QPushButton#updateBadgeButton:hover {{
+                background: {colors["accent_hover"]};
+            }}
             QFrame#historyListItem {{
                 background: {colors["input_bg"]};
                 border: 1px solid {colors["editor_border"]};
@@ -2204,6 +2221,28 @@ class ResultPanel(QWidget):
 
     def set_title_recommendation(self, title_text):
         self.title_label_box.setText(title_text)
+
+    def set_update_available(self, visible, latest_version="", message="", download_url=""):
+        self._update_available = bool(visible)
+        self._update_latest_version = str(latest_version or "").strip()
+        self._update_message = str(message or "").strip()
+        self._update_download_url = str(download_url or "").strip()
+        self.header_update_btn.setText("버전 UP")
+        tooltip = "새 버전 알림"
+        if self._update_latest_version:
+            tooltip = f"새 버전 {self._update_latest_version}"
+        self.header_update_btn.setToolTip(tooltip)
+        self.header_update_btn.setVisible(self._update_available)
+
+    def get_update_notice_text(self):
+        message = getattr(self, "_update_message", "")
+        download_url = getattr(self, "_update_download_url", "")
+        lines = []
+        if message:
+            lines.append(message)
+        if download_url:
+            lines.append(f"다운로드 주소: {download_url}")
+        return "\n".join(line for line in lines if line).strip()
 
     def clear_spell_result(self):
         self.spell_box.clear()

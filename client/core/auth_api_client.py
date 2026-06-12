@@ -5,6 +5,8 @@ from pathlib import Path
 
 import requests
 
+from client.config import REMOTE_SERVER_URL
+
 
 class UnauthorizedError(ValueError):
     pass
@@ -13,7 +15,7 @@ class UnauthorizedError(ValueError):
 class AuthAPIClient:
     SESSION_FILE = Path(__file__).resolve().parents[2] / ".auth_session.json"
 
-    def __init__(self, base_url="http://127.0.0.1:8765"):
+    def __init__(self, base_url=REMOTE_SERVER_URL):
         self.base_url = base_url.rstrip("/")
         self.access_token = None
         self.current_username = None
@@ -123,6 +125,13 @@ class AuthAPIClient:
 
     def update_settings(self, settings):
         return self._authorized_request("put", "/settings", json=settings)
+
+    def get_client_version_info(self):
+        response = requests.get(
+            f"{self.base_url}/client-version",
+            timeout=10,
+        )
+        return self._handle_response(response)
 
     def _authorized_request(self, method, path, **kwargs):
         if not self.access_token:

@@ -1,3 +1,4 @@
+import os
 import time
 from datetime import datetime, timezone
 
@@ -55,6 +56,7 @@ from schemas import (
 
 
 SERVER_API_VERSION = "openai-separated-v8"
+DEFAULT_CLIENT_VERSION = "1.0.0"
 
 app = FastAPI(title="AI 문서 보조 서버")
 Base.metadata.create_all(bind=engine)
@@ -417,6 +419,23 @@ def server_info():
             "/history/requests",
         ],
         "openai_key_fingerprint": AIService.current_api_key_fingerprint(),
+    }
+
+
+@app.get("/client-version")
+def client_version():
+    latest_version = (os.getenv("LATEST_CLIENT_VERSION") or DEFAULT_CLIENT_VERSION).strip()
+    minimum_version = (os.getenv("MINIMUM_CLIENT_VERSION") or "").strip()
+    download_url = (os.getenv("LATEST_CLIENT_DOWNLOAD_URL") or "").strip()
+    message = (
+        os.getenv("LATEST_CLIENT_MESSAGE")
+        or f"새 버전 {latest_version} 이(가) 준비되었습니다."
+    ).strip()
+    return {
+        "latest_version": latest_version,
+        "minimum_version": minimum_version,
+        "download_url": download_url,
+        "message": message,
     }
 
 

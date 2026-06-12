@@ -22,6 +22,7 @@ except Exception:  # pragma: no cover - optional Windows dependency
     win32con = None
 
 from client.app_settings import DEFAULT_SETTINGS, load_app_settings, save_app_settings
+from client.config import APP_VERSION
 from client.core.auth_api_client import AuthAPIClient, UnauthorizedError
 from client.core.analyzer import TextAnalyzer
 from client.core.line_structure import preserve_replacement_structure
@@ -41,6 +42,7 @@ class SignalBridge(QObject):
     text_signal = pyqtSignal(object)
     auth_sync_signal = pyqtSignal(object)
     spell_check_signal = pyqtSignal(object)
+    update_signal = pyqtSignal(object)
 
 
 class CorrectionOverlayButton(QPushButton):
@@ -442,6 +444,8 @@ class App:
         self.last_correction_source_text = ""
         self.current_history_request_id = None
         self.current_history_source_text = ""
+        self.update_info = None
+        self.update_notice_shown = False
         self.last_output_target = None
         self.suppress_replacement_echo_until = 0.0
         self.suppress_replacement_echo_text = ""
@@ -465,6 +469,7 @@ class App:
         self.signals.text_signal.connect(self.handle_input_event)
         self.signals.auth_sync_signal.connect(self.handle_background_auth_sync_result)
         self.signals.spell_check_signal.connect(self.handle_spell_check_result)
+        self.signals.update_signal.connect(self.handle_update_check_result)
         # Overlay mode is deprecated; use in-panel apply action only.
         self.correction_overlay = None
         self.overlay_timer = None
@@ -486,6 +491,7 @@ class App:
         self.panel.close_settings_btn.clicked.connect(self.panel.close_settings_page)
         self.panel.login_btn.clicked.connect(self.handle_login_button)
         self.panel.header_history_btn.clicked.connect(lambda: self.show_history(0))
+        self.panel.header_update_btn.clicked.connect(self.show_update_notice)
         self.panel.login_submit_btn.clicked.connect(self.handle_login_submit)
         self.panel.signup_submit_btn.clicked.connect(self.handle_signup_submit)
         self.panel.account_manage_btn.clicked.connect(self.handle_account_manage_button)
@@ -508,6 +514,7 @@ class App:
         self.init_tray()
         self.update_login_state()
         QTimer.singleShot(0, self.start_restored_login_sync)
+        QTimer.singleShot(200, self.start_update_check)
 
     def initialize_auth(self):
         self.api_client.try_restore_session()
@@ -550,6 +557,81 @@ class App:
         self.ensure_realtime_monitor_started()
 
         sys.exit(self.qt_app.exec_())
+
+    def start_update_check(self):
+        threading.Thread(target=self.run_update_check, daemon=True).start()
+
+    def run_update_check(self):
+        try:
+            data = self.api_client.get_client_version_info()
+        except Exception:
+            return
+
+        latest_version = str(data.get("latest_version", "") or "").strip()
+        if not latest_version or not self._is_version_newer(latest_version, APP_VERSION):
+            self.signals.update_signal.emit({"available": False})
+            return
+
+        self.signals.update_signal.emit(
+            {
+                "available": True,
+                "current_version": APP_VERSION,
+                "latest_version": latest_version,
+                "minimum_version": str(data.get("minimum_version", "") or "").strip(),
+                "download_url": str(data.get("download_url", "") or "").strip(),
+                "message": str(data.get("message", "") or "").strip(),
+            }
+        )
+
+    def handle_update_check_result(self, result):
+        if not isinstance(result, dict):
+            return
+        if not bool(result.get("available")):
+            self.update_info = None
+            self.panel.set_update_available(False)
+            return
+
+        self.update_info = result
+        self.panel.set_update_available(
+            True,
+            latest_version=result.get("latest_version", ""),
+            message=result.get("message", ""),
+            download_url=result.get("download_url", ""),
+        )
+        if not self.update_notice_shown:
+            self.update_notice_shown = True
+            self.show_update_notice()
+
+    def show_update_notice(self):
+        if not isinstance(self.update_info, dict):
+            return
+        latest_version = str(self.update_info.get("latest_version", "") or "").strip()
+        current_version = str(self.update_info.get("current_version", APP_VERSION) or APP_VERSION).strip()
+        notice_text = self.panel.get_update_notice_text()
+        lines = [
+            f"현재 버전: {current_version}",
+        ]
+        if latest_version:
+            lines.append(f"최신 버전: {latest_version}")
+        if notice_text:
+            lines.append("")
+            lines.append(notice_text)
+        self.panel.show_notice("업데이트 알림", "\n".join(lines).strip())
+
+    def _is_version_newer(self, latest_version, current_version):
+        return self._version_key(latest_version) > self._version_key(current_version)
+
+    def _version_key(self, value):
+        parts = []
+        for chunk in str(value or "").replace("-", ".").split("."):
+            digits = "".join(char for char in chunk if char.isdigit())
+            if digits:
+                parts.append(int(digits))
+            else:
+                parts.append(0)
+        while len(parts) < 4:
+            parts.append(0)
+        return tuple(parts[:4])
 
     def run_monitor(self, initial_text):
         from client.input.ai_grammary_text_reader import UniversalActiveTextReader
