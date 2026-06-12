@@ -2,6 +2,7 @@
 import sys
 import threading
 import time
+import copy
 from datetime import datetime
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from client.core.analyzer import TextAnalyzer
 from client.core.line_structure import preserve_replacement_structure
 from client.core.local_server import LocalServer
 from client.input.clipboard_monitor import monitor_clipboard
+from client.ui.main_overlay import MainOverlay
 from client.ui.result_panel import ResultPanel
 
 
@@ -364,6 +366,65 @@ class App:
         self.panel = ResultPanel(
             initial_dark_mode=self.settings.get("default_dark_mode", False)
         )
+        self.word_main_overlay = MainOverlay()
+        overlay_mode = self.settings.get("input_mode", "clipboard")
+        self.word_main_overlay.set_active_mode(
+            "drag" if overlay_mode == "selection" else overlay_mode
+        )
+        self.word_main_overlay.set_spelling_replace_mode(
+            self.settings.get("replace_mode", False)
+        )
+        self.word_main_overlay.set_dark_mode(
+            self.settings.get("default_dark_mode", False)
+        )
+        self.word_overlay_history_hwnd = None
+        self.word_overlay_original_text = ""
+        self.word_overlay_corrected_text = ""
+        self.word_overlay_original_target = None
+        self.word_overlay_corrected_target = None
+        self.word_overlay_snapshot_locked = False
+        self.word_main_overlay.evaluate_requested.connect(
+            lambda: self.handle_word_overlay_action("evaluate")
+        )
+        self.word_main_overlay.evaluation_reason_requested.connect(
+            self.handle_word_overlay_evaluation_reason
+        )
+        self.word_main_overlay.title_requested.connect(
+            lambda: self.handle_word_overlay_action("title")
+        )
+        self.word_main_overlay.spelling_requested.connect(
+            self.apply_correction_to_source
+        )
+        self.word_main_overlay.tone_requested.connect(
+            lambda: self.handle_word_overlay_action("tone")
+        )
+        self.word_main_overlay.tone_submitted.connect(
+            self.apply_word_overlay_tone_change
+        )
+        self.word_main_overlay.summary_requested.connect(
+            lambda: self.handle_word_overlay_action("summary")
+        )
+        self.word_main_overlay.settings_save_requested.connect(
+            self.handle_word_overlay_settings_save
+        )
+        self.word_main_overlay.open_panel_requested.connect(self.show_panel)
+        self.word_main_overlay.history_requested.connect(
+            self.show_word_overlay_history
+        )
+        self.word_main_overlay.undo_requested.connect(
+            self.undo_last_word_overlay_correction
+        )
+        self.word_main_overlay.redo_requested.connect(
+            self.redo_last_word_overlay_correction
+        )
+        self.word_main_overlay.title_insert_requested.connect(
+            self.insert_word_overlay_title
+        )
+        self.word_main_overlay.summary_copy_requested.connect(self.safe_copy)
+        self.word_overlay_timer = QTimer(self.qt_app)
+        self.word_overlay_timer.setInterval(60)
+        self.word_overlay_timer.timeout.connect(self.update_word_overlay_presence)
+        self.word_overlay_timer.start()
         self.panel.set_default_dark_mode_checked(
             self.settings.get("default_dark_mode", False)
         )
@@ -419,10 +480,12 @@ class App:
         self.panel.evaluate_btn.clicked.connect(self.run_evaluation)
         self.panel.recommend_title_btn.clicked.connect(self.run_title_recommendation)
         self.panel.run_summary_btn.clicked.connect(self.run_summary)
+        self.panel.summary_history_btn.clicked.connect(lambda: self.show_history(3))
         self.panel.run_tone_btn.clicked.connect(self.run_tone_change)
         self.panel.save_settings_btn.clicked.connect(self.save_settings)
         self.panel.close_settings_btn.clicked.connect(self.panel.close_settings_page)
         self.panel.login_btn.clicked.connect(self.handle_login_button)
+        self.panel.header_history_btn.clicked.connect(lambda: self.show_history(0))
         self.panel.login_submit_btn.clicked.connect(self.handle_login_submit)
         self.panel.signup_submit_btn.clicked.connect(self.handle_signup_submit)
         self.panel.account_manage_btn.clicked.connect(self.handle_account_manage_button)
@@ -489,16 +552,541 @@ class App:
         sys.exit(self.qt_app.exec_())
 
     def run_monitor(self, initial_text):
+        from client.input.ai_grammary_text_reader import UniversalActiveTextReader
+
+        clipboard_reader = UniversalActiveTextReader()
+
         def callback(text):
-            self.signals.text_signal.emit(
-                {
-                    "source": "clipboard",
-                    "window_title": "",
-                    "text": text,
-                }
-            )
+            event = {
+                "source": "clipboard",
+                "window_title": "",
+                "text": text,
+            }
+            snapshot = clipboard_reader.poll_snapshot(selection_only=True)
+            if snapshot is None or str(snapshot.text or "").strip() != str(text or "").strip():
+                snapshot = clipboard_reader.poll_snapshot(selection_only=False)
+            if snapshot is not None and str(snapshot.text or "").strip() == str(text or "").strip():
+                event.update(
+                    {
+                        "window_title": snapshot.window_title,
+                        "reader": snapshot.reader_name,
+                        "window_handle": snapshot.window_handle,
+                        "style_info": snapshot.style_info,
+                    }
+                )
+            self.signals.text_signal.emit(event)
 
         monitor_clipboard(callback, initial_text=initial_text)
+
+    def update_word_overlay_presence(self):
+        if win32gui is None or not hasattr(self, "word_main_overlay"):
+            return
+        if self.word_main_overlay.has_overlay_focus():
+            return
+        try:
+            hwnd = int(win32gui.GetForegroundWindow() or 0)
+            if not hwnd or not win32gui.IsWindow(hwnd):
+                self.word_main_overlay.hide_with_reason("word_window_missing")
+                return
+            if self._has_document_modal_popup(hwnd):
+                if self.word_main_overlay.isVisible():
+                    self.word_main_overlay.hide_with_reason("document_modal_popup")
+                return
+            from client.input.ai_grammary_text_reader import HWP_PROCESS_NAMES, WORD_PROCESS_NAMES, get_process_name
+
+            process_name = get_process_name(hwnd)
+            if process_name in WORD_PROCESS_NAMES:
+                reader_name = "word"
+                self.word_main_overlay.set_action_buttons_enabled(
+                    evaluate=True,
+                    title=True,
+                    spelling=True,
+                    tone=True,
+                    summary=True,
+                )
+            elif process_name in HWP_PROCESS_NAMES:
+                reader_name = "hwp"
+                self.word_main_overlay.set_action_buttons_enabled(
+                    evaluate=True,
+                    title=True,
+                    spelling=True,
+                    tone=True,
+                    summary=True,
+                )
+            else:
+                if self.word_main_overlay.isVisible():
+                    self.word_main_overlay.hide_with_reason("word_not_foreground")
+                return
+            if win32gui.IsIconic(hwnd) or not win32gui.IsWindowVisible(hwnd):
+                self.word_main_overlay.hide_with_reason("word_window_hidden")
+                return
+            if reader_name != "word" or self.word_overlay_history_hwnd not in {None, hwnd}:
+                self.word_main_overlay.set_undo_available(False)
+                self.word_main_overlay.set_redo_available(False)
+            self.word_main_overlay.show_for_target(reader_name, hwnd)
+        except Exception:
+            if self.word_main_overlay.isVisible():
+                self.word_main_overlay.hide_with_reason("word_overlay_update_failed")
+
+    def _has_document_modal_popup(self, hwnd):
+        if win32gui is None or not hwnd:
+            return False
+        try:
+            class_name = (win32gui.GetClassName(hwnd) or "").strip()
+            if class_name == "#32770":
+                return True
+            owner = int(win32gui.GetWindow(hwnd, 4) or 0)  # GW_OWNER
+            if owner and owner != int(hwnd):
+                return True
+            root = int(win32gui.GetAncestor(hwnd, 2) or hwnd)
+            if root and root != int(hwnd):
+                root_enabled_popup = int(win32gui.GetWindow(root, 6) or 0)  # GW_ENABLEDPOPUP
+                if root_enabled_popup and root_enabled_popup != root:
+                    return True
+            return False
+        except Exception:
+            return False
+
+    def _refresh_word_overlay_input(self):
+        hwnd = int(getattr(self.word_main_overlay, "_last_window_handle", 0) or 0)
+        if not hwnd:
+            return False
+        try:
+            import pythoncom
+            import win32com.client as win32
+
+            from client.input.ai_grammary_text_reader import ActiveWordReader, get_window_title
+            from client.input.output_applier import OutputTarget
+
+            pythoncom.CoInitialize()
+            word = win32.GetActiveObject("Word.Application")
+            document = getattr(word, "ActiveDocument", None)
+            if document is None:
+                return False
+            reader = ActiveWordReader()
+            text = reader._read_paragraph_text(document)
+            if not str(text or "").strip():
+                return False
+            style_info = reader._read_style_info_from_document(document)
+            self.last_input = text
+            self.last_correction_source_text = text
+            self.current_history_source_text = text
+            self.last_output_target = OutputTarget(
+                mode="word",
+                window_handle=hwnd,
+                window_title=get_window_title(hwnd),
+                style_info=style_info,
+            )
+            self.panel.set_original_text(text)
+            self._capture_original_snapshot(text, self.last_output_target)
+            return True
+        except Exception as exc:
+            self.word_main_overlay.show_status(f"Word 읽기 실패: {exc}", auto_hide_ms=1600)
+            return False
+
+    def _refresh_hwp_overlay_input(self):
+        hwnd = int(getattr(self.word_main_overlay, "_last_window_handle", 0) or 0)
+        if not hwnd:
+            return False
+        try:
+            from client.input.ai_grammary_text_reader import ActiveHwpReader, get_window_title
+            from client.input.output_applier import OutputTarget
+
+            reader = ActiveHwpReader()
+            if not reader._is_hwp_window(hwnd):
+                return False
+            reader._log_hwp_window(hwnd)
+            hwp = reader._get_hwp_object_from_native_om(hwnd)
+            if hwp is None:
+                hwp = reader._get_active_hwp_object()
+            if hwp is None:
+                hwp = reader._get_hwp_object_from_rot()
+            com_text = reader._read_text_via_hwp_com(hwp) if hwp is not None else ""
+            uia_text = reader._read_text_via_uia(hwnd)
+            text, read_method = reader._choose_hwp_live_text(com_text, uia_text)
+            text = reader._stabilize_hwp_text(text)
+            if not str(text or "").strip():
+                return False
+            reader._last_read_method = read_method
+            reader._last_hwp_text = str(text or "")
+            reader._last_hwp_style_info = (
+                reader._read_hwp_style_info(hwp)
+                if read_method == "com" and hwp is not None
+                else {}
+            )
+            style_info = reader.read_style_info() or {}
+            self.last_input = text
+            self.last_correction_source_text = text
+            self.current_history_source_text = text
+            self.last_output_target = OutputTarget(
+                mode="hwp",
+                window_handle=hwnd,
+                window_title=get_window_title(hwnd),
+                style_info=style_info,
+            )
+            self.panel.set_original_text(text)
+            self._capture_original_snapshot(text, self.last_output_target)
+            return True
+        except Exception as exc:
+            self.word_main_overlay.show_status(f"한글 읽기 실패: {exc}", auto_hide_ms=1600)
+            return False
+
+    def _refresh_overlay_input_for_reader(self, reader_name):
+        reader_name = str(reader_name or "").strip().lower()
+        if reader_name == "hwp":
+            return self._refresh_hwp_overlay_input()
+        return self._refresh_word_overlay_input()
+
+    def _overlay_reader_display_name(self, reader_name):
+        return "한글" if str(reader_name or "").strip().lower() == "hwp" else "Word"
+
+    def add_word_overlay_notification(self, message, error=False):
+        self.word_main_overlay.add_notification(message, error=error)
+
+    def show_word_overlay_history(self):
+        self.show_panel()
+        self.show_history(0)
+
+    def undo_last_word_overlay_correction(self):
+        self._replace_word_overlay_snapshot("undo")
+
+    def redo_last_word_overlay_correction(self):
+        self._replace_word_overlay_snapshot("redo")
+
+    def _capture_original_snapshot(self, source_text, target):
+        displayed_text = ""
+        try:
+            displayed_text = self.panel.text_box.toPlainText()
+        except Exception:
+            pass
+        text = str(displayed_text or source_text or "")
+        if not text.strip() or target is None:
+            self.word_overlay_history_hwnd = None
+            self.word_overlay_original_text = ""
+            self.word_overlay_corrected_text = ""
+            self.word_overlay_original_target = None
+            self.word_overlay_corrected_target = None
+            self.word_overlay_snapshot_locked = False
+            self.word_main_overlay.set_undo_available(False)
+            self.word_main_overlay.set_redo_available(False)
+            return
+        self.word_overlay_original_text = text
+        self.word_overlay_corrected_text = ""
+        self.word_overlay_original_target = copy.deepcopy(target)
+        self.word_overlay_corrected_target = None
+        self.word_overlay_history_hwnd = int(getattr(target, "window_handle", 0) or 0)
+        self.word_overlay_snapshot_locked = False
+        self.word_main_overlay.set_undo_available(True)
+        self.word_main_overlay.set_redo_available(False)
+
+    def _snapshot_target_for_current_text(self, target, current_text):
+        snapshot_target = copy.deepcopy(target)
+        if snapshot_target is None:
+            return None
+        style_info = dict(getattr(snapshot_target, "style_info", None) or {})
+        if not style_info.get("selection_mode"):
+            return snapshot_target
+
+        text = str(current_text or "")
+        if snapshot_target.mode == "word":
+            start = style_info.get("word_selection_start")
+            if start is not None:
+                style_info["word_selection_end"] = int(start) + len(text)
+                style_info["selection_text"] = text
+        elif snapshot_target.mode == "hwp":
+            start_pos = style_info.get("hwp_selection_start_pos")
+            if isinstance(start_pos, (list, tuple)) and len(start_pos) >= 2:
+                start_para, start_col = int(start_pos[0]), int(start_pos[1])
+                lines = text.split("\n")
+                end_pos = (
+                    (start_para, start_col + len(lines[0]))
+                    if len(lines) == 1
+                    else (start_para + len(lines) - 1, len(lines[-1]))
+                )
+                style_info["hwp_selection_end_pos"] = end_pos
+                style_info["hwp_selection_length"] = len(text)
+                style_info["selection_text"] = text
+                style_info["_source_text"] = text
+        elif snapshot_target.mode == "notepad":
+            start = style_info.get("selection_start")
+            if start is not None:
+                style_info["selection_end"] = int(start) + len(text)
+                style_info["selection_text"] = text
+
+        snapshot_target.style_info = style_info
+        return snapshot_target
+
+    def _commit_replacement_snapshot(self, corrected_text, applied_target=None):
+        target = applied_target or self.last_output_target
+        if target is None or not str(corrected_text or "").strip():
+            return
+        original_text = str(
+            self.word_overlay_original_text
+            or self.last_correction_source_text
+            or self.panel.text_box.toPlainText()
+            or self.last_input
+            or ""
+        )
+        if not original_text.strip():
+            return
+        original_style_target = self.word_overlay_original_target or copy.deepcopy(target)
+        self.word_overlay_original_text = original_text
+        self.word_overlay_corrected_text = str(corrected_text)
+        self.word_overlay_original_target = self._snapshot_target_for_current_text(
+            original_style_target,
+            corrected_text,
+        )
+        self.word_overlay_corrected_target = self._snapshot_target_for_current_text(
+            target,
+            original_text,
+        )
+        self.word_overlay_history_hwnd = int(getattr(target, "window_handle", 0) or 0)
+        self.word_overlay_snapshot_locked = True
+        self.word_main_overlay.set_undo_available(True)
+        self.word_main_overlay.set_redo_available(True)
+
+    def _begin_word_overlay_spelling_snapshot(self, source_text):
+        target = self.last_output_target
+        if target is None:
+            return
+        target_hwnd = int(getattr(target, "window_handle", 0) or 0)
+        if (
+            self.word_overlay_snapshot_locked
+            and self.word_overlay_history_hwnd == target_hwnd
+            and self.word_overlay_original_text
+            and self.word_overlay_corrected_text
+        ):
+            return
+        if (
+            self.word_overlay_original_target is not None
+            and self.word_overlay_original_text == str(source_text or "")
+            and self.word_overlay_history_hwnd == target_hwnd
+        ):
+            return
+        panel_source_text = ""
+        try:
+            panel_source_text = self.panel.text_box.toPlainText()
+        except Exception:
+            pass
+        self.word_overlay_original_text = str(panel_source_text or source_text or "")
+        self.word_overlay_corrected_text = ""
+        self.word_overlay_original_target = copy.deepcopy(target)
+        self.word_overlay_corrected_target = None
+        self.word_overlay_history_hwnd = target_hwnd
+        self.word_overlay_snapshot_locked = False
+        self.word_main_overlay.set_undo_available(False)
+        self.word_main_overlay.set_redo_available(False)
+
+    def _complete_word_overlay_spelling_snapshot(self, source_text, corrected_text):
+        target = self.last_output_target
+        if target is None:
+            return
+        target_hwnd = int(getattr(target, "window_handle", 0) or 0)
+        if (
+            self.word_overlay_snapshot_locked
+            and self.word_overlay_history_hwnd == target_hwnd
+            and self.word_overlay_original_text
+            and self.word_overlay_corrected_text
+        ):
+            return
+        if not self.word_overlay_original_text:
+            self.word_overlay_original_text = str(source_text or "")
+        if self.word_overlay_original_target is None:
+            self.word_overlay_original_target = copy.deepcopy(target)
+        self.word_overlay_corrected_text = str(corrected_text or "")
+        self.word_overlay_history_hwnd = target_hwnd
+        self.word_main_overlay.set_redo_available(
+            bool(self.word_overlay_corrected_text.strip())
+        )
+
+    def _replace_word_overlay_snapshot(self, action):
+        if action not in {"undo", "redo"}:
+            return
+        text = (
+            self.word_overlay_original_text
+            if action == "undo"
+            else self.word_overlay_corrected_text
+        )
+        target = (
+            self.word_overlay_original_target
+            if action == "undo"
+            else self.word_overlay_corrected_target or self.word_overlay_original_target
+        )
+        if not str(text or "").strip() or target is None:
+            message = "되돌릴 원문이 없습니다." if action == "undo" else "다시 적용할 교정문이 없습니다."
+            self.word_main_overlay.show_status(message, auto_hide_ms=1400)
+            return
+        try:
+            if action == "redo" and self.word_overlay_corrected_target is None:
+                self.last_output_target = target
+                if not self._apply_correction_text(text):
+                    raise RuntimeError("교정문 원본 치환에 실패했습니다.")
+                target = self.word_overlay_corrected_target or target
+            else:
+                self.get_output_applier().apply(target, text)
+            self.last_output_target = target
+            self.last_corrected_text = text if action == "redo" else self.word_overlay_corrected_text
+            self.suppress_replacement_echo_text = text
+            self.suppress_replacement_echo_until = time.monotonic() + 4.0
+            is_undo = action == "undo"
+            self.word_main_overlay.set_undo_available(not is_undo)
+            self.word_main_overlay.set_redo_available(is_undo)
+            self.word_overlay_history_hwnd = int(getattr(target, "window_handle", 0) or 0)
+            message = "되돌리기 완료" if is_undo else "다시 실행 완료"
+            self.word_main_overlay.show_status(message, auto_hide_ms=1200)
+            self.add_word_overlay_notification(message)
+        except Exception as exc:
+            message = "되돌리기 실패" if action == "undo" else "다시 실행 실패"
+            self.word_main_overlay.show_status(message, auto_hide_ms=1400)
+            self.add_word_overlay_notification(
+                f"{message}: {type(exc).__name__}",
+                error=True,
+            )
+
+    def handle_word_overlay_settings_save(self, mode, replace_mode=False):
+        input_mode = "selection" if mode == "drag" else "realtime"
+        settings = self.settings.copy()
+        settings["input_mode"] = input_mode
+        settings["replace_mode"] = bool(replace_mode) and input_mode == "realtime"
+        self.apply_settings_state(settings)
+        if self.is_logged_in():
+            try:
+                self.save_remote_settings()
+            except Exception as exc:
+                self.add_word_overlay_notification(
+                    f"설정 동기화 실패: {type(exc).__name__}",
+                    error=True,
+                )
+        self.word_main_overlay.set_active_mode(
+            "drag" if input_mode == "selection" else input_mode
+        )
+        self.word_main_overlay.set_spelling_replace_mode(settings["replace_mode"])
+        self.word_main_overlay.show_status("저장됨")
+        self.add_word_overlay_notification("오버레이 설정 저장 완료")
+
+    def apply_word_overlay_tone_change(self, tone):
+        tone = str(tone or "").strip()
+        if not tone:
+            return
+        self.word_main_overlay.show_busy("문체 변경 진행중")
+        self.add_word_overlay_notification("문체 변경 시작")
+        QApplication.processEvents()
+        try:
+            result = self.analyzer.analyze_tone_change(self.last_input, tone)
+            self.panel.set_tone_result(result)
+            self.save_history_log(
+                feature_type=4,
+                input_text=self._history_source_text(),
+                request_id=self.current_history_request_id,
+                output_text=result,
+                tone=tone,
+            )
+            replacement = self._prepare_replacement_text(result)
+            self.get_output_applier().apply(self.last_output_target, replacement)
+            self.last_corrected_text = replacement
+            self._commit_replacement_snapshot(replacement, self.last_output_target)
+            self.word_main_overlay.show_text_result("문체 변환 결과", result)
+            self.word_main_overlay.show_status("문체 변경 완료")
+            self.add_word_overlay_notification("문체 변경 완료")
+        except Exception as exc:
+            self.word_main_overlay.show_status(f"문체 변경 실패: {exc}", auto_hide_ms=1800)
+            self.add_word_overlay_notification(
+                f"문체 변경 실패: {type(exc).__name__}",
+                error=True,
+            )
+        finally:
+            self.word_main_overlay.hide_busy()
+
+    def handle_word_overlay_action(self, action):
+        reader_name = str(getattr(self.word_main_overlay, "_last_reader_name", "") or "word")
+        if not self._refresh_overlay_input_for_reader(reader_name):
+            self.word_main_overlay.show_status("텍스트 없음", auto_hide_ms=1200)
+            self.add_word_overlay_notification(f"{self._overlay_reader_display_name(reader_name)} 텍스트를 찾을 수 없음", error=True)
+            return
+        if action == "tone":
+            self.word_main_overlay.show_tone_prompt()
+            return
+
+        self.word_main_overlay.show_busy(
+            {
+                "evaluate": "평가 진행중",
+                "title": "제목 추천중",
+                "summary": "요약 진행중",
+            }.get(action, "처리중")
+        )
+        action_label = {
+            "evaluate": "평가",
+            "title": "제목 추천",
+            "summary": "요약",
+        }.get(action, "작업")
+        self.add_word_overlay_notification(f"{action_label} 시작")
+        QApplication.processEvents()
+        try:
+            if action == "evaluate":
+                result = self.run_evaluation()
+                if result:
+                    score = self._parse_score(result) or 0
+                    self.word_main_overlay.show_evaluation_score(
+                        score,
+                        "",
+                    )
+                    self.add_word_overlay_notification("평가 완료")
+                else:
+                    self.add_word_overlay_notification("평가 실패", error=True)
+            elif action == "title":
+                result = self.run_title_recommendation()
+                if result:
+                    self.word_main_overlay.show_title_confirmation(result)
+                    self.add_word_overlay_notification("제목 추천 완료")
+                else:
+                    self.add_word_overlay_notification("제목 추천 실패", error=True)
+            elif action == "summary":
+                result = self.run_summary()
+                if result:
+                    self.word_main_overlay.show_summary_result(
+                        self._strip_result_heading(result)
+                    )
+                    self.add_word_overlay_notification("요약 완료")
+                else:
+                    self.add_word_overlay_notification("요약 실패", error=True)
+        finally:
+            self.word_main_overlay.hide_busy()
+
+    def insert_word_overlay_title(self, title):
+        clean_title = str(title or "").strip()
+        if not clean_title:
+            return
+        target = self.last_output_target
+        if target and target.mode == "hwp":
+            try:
+                if not self._refresh_hwp_overlay_input():
+                    raise RuntimeError("활성 한글 문서를 찾을 수 없습니다.")
+                self.get_output_applier().insert_hwp_title(
+                    self.last_output_target.window_handle,
+                    clean_title,
+                )
+                self.word_main_overlay.show_status("제목 삽입 완료")
+            except Exception as exc:
+                self.word_main_overlay.show_status(f"제목 삽입 실패: {exc}", auto_hide_ms=1800)
+            return
+        try:
+            import pythoncom
+            import win32com.client as win32
+
+            pythoncom.CoInitialize()
+            word = win32.GetActiveObject("Word.Application")
+            document = getattr(word, "ActiveDocument", None)
+            if document is None:
+                raise RuntimeError("활성 Word 문서를 찾을 수 없습니다.")
+            insert_text = f"{clean_title}\r\r"
+            document.Range(Start=0, End=0).InsertBefore(insert_text)
+            title_range = document.Range(Start=0, End=len(clean_title))
+            title_range.Font.Bold = True
+            title_range.Font.Size = 14
+            document.Paragraphs.Item(1).Range.ParagraphFormat.Alignment = 1
+            self.word_main_overlay.show_status("제목 삽입 완료")
+        except Exception as exc:
+            self.word_main_overlay.show_status(f"제목 삽입 실패: {exc}", auto_hide_ms=1800)
 
     def run_realtime_monitor(self):
         from client.input.realtime_text_monitor import monitor_realtime_text
@@ -562,8 +1150,9 @@ class App:
         self.current_history_request_id = None
         self.current_history_source_text = text
         self.correction_overlay_suppressed = False
-        self.last_output_target = self._build_output_target(event) if source in {"realtime", "selection"} else None
+        self.last_output_target = self._build_output_target(event)
         self.panel.set_original_text(text)
+        self._capture_original_snapshot(text, self.last_output_target)
         self.schedule_spell_check()
         self.update_correction_overlay()
 
@@ -583,6 +1172,15 @@ class App:
         self.pending_apply_correction = False
         self.spell_check_request_id += 1
         self._set_live_reading_paused(False)
+        if hasattr(self, "word_main_overlay"):
+            self.word_overlay_history_hwnd = None
+            self.word_overlay_original_text = ""
+            self.word_overlay_corrected_text = ""
+            self.word_overlay_original_target = None
+            self.word_overlay_corrected_target = None
+            self.word_overlay_snapshot_locked = False
+            self.word_main_overlay.set_undo_available(False)
+            self.word_main_overlay.set_redo_available(False)
         self.panel.reset_text_tab()
         self.panel.clear_spell_result()
         self.panel.clear_summary_result()
@@ -628,6 +1226,7 @@ class App:
         self.last_correction_source_text = source_text
         self.current_history_source_text = source_text
         self.last_corrected_text = ""
+        self._begin_word_overlay_spelling_snapshot(source_text)
         self.panel.set_spell_result("OpenAI 맞춤법 요청 중입니다...")
         self.update_correction_overlay()
         self._set_live_reading_paused(True)
@@ -686,6 +1285,10 @@ class App:
         result = spelling_payload.get("formatted", "")
         spelling_feedback = spelling_payload.get("spelling_feedback") or self.analyzer.TEMP_SPELLING_FEEDBACK
         self.last_corrected_text = spelling_payload.get("corrected", "")
+        self._complete_word_overlay_spelling_snapshot(
+            source_text,
+            self.last_corrected_text,
+        )
         self.panel.set_spell_result(result)
         self.update_correction_overlay()
         self.save_history_log(
@@ -718,6 +1321,7 @@ class App:
             return
         self.last_correction_source_text = self.last_input
         self.current_history_source_text = self.last_correction_source_text
+        self._begin_word_overlay_spelling_snapshot(self.last_correction_source_text)
         try:
             spelling_payload = self.analyzer.get_spelling_result_payload(self.last_correction_source_text)
         except Exception as exc:
@@ -728,6 +1332,10 @@ class App:
         result = spelling_payload["formatted"]
         spelling_feedback = spelling_payload.get("spelling_feedback") or self.analyzer.TEMP_SPELLING_FEEDBACK
         self.last_corrected_text = spelling_payload["corrected"]
+        self._complete_word_overlay_spelling_snapshot(
+            self.last_correction_source_text,
+            self.last_corrected_text,
+        )
         self.panel.set_spell_result(result)
         self.update_correction_overlay()
         self.save_history_log(
@@ -740,18 +1348,18 @@ class App:
 
     def apply_correction_to_source(self):
         if not self._can_apply_source_correction():
-            return
+            return False
         if self.spell_check_in_progress or not str(self.last_corrected_text or "").strip():
             self.pending_apply_correction = True
             self.panel.set_spell_result("교정된 텍스트를 기다리는 중입니다...\n\n결과가 도착하면 자동으로 원본 수정이 진행됩니다.")
-            return
+            return None
         self.pending_apply_correction = False
-        self._apply_correction_text(self.last_corrected_text)
+        return self._apply_correction_text(self.last_corrected_text)
 
     def _apply_correction_text(self, text):
         if not text:
             self.panel.set_spell_result("수정할 맞춤법 검사 결과가 없습니다.")
-            return
+            return False
 
         output_applier = self.get_output_applier()
         can_replace, reason = output_applier.inspect_replace_availability(self.last_output_target)
@@ -761,11 +1369,19 @@ class App:
                 + "\n\n[원본 수정 실패]\n"
                 + (reason or "원본 창을 찾을 수 없습니다.")
             )
-            return
+            return False
 
         try:
             self._pause_realtime_replace_polling()
             previous_spell_text = self.panel.spell_box.toPlainText().rstrip()
+            if self.last_output_target and self.word_overlay_original_target is None:
+                self.word_overlay_original_text = str(
+                    self.last_correction_source_text
+                    or self.panel.text_box.toPlainText()
+                    or self.last_input
+                    or ""
+                )
+                self.word_overlay_original_target = copy.deepcopy(self.last_output_target)
             text = self._prepare_replacement_text(text)
             guard_message = self._validate_selection_replacement_guard(text)
             if guard_message:
@@ -774,7 +1390,7 @@ class App:
                     + "\n\n[원본 수정 중단]\n"
                     + guard_message
                 )
-                return
+                return False
             style_map_info = self._maybe_apply_openai_style_mapping(text)
             mapped_text = str(style_map_info.get("mapped_corrected_text") or "").strip()
             if mapped_text:
@@ -808,12 +1424,15 @@ class App:
             )
             self.correction_overlay_suppressed = True
             self.update_correction_overlay(force_hide=True)
+            self._commit_replacement_snapshot(text, self.last_output_target)
+            return True
         except Exception as exc:
             self.panel.set_spell_result(
                 self.panel.spell_box.toPlainText().rstrip()
                 + f"\n\n[원본 수정 실패]\n{exc}"
             )
             self.update_correction_overlay()
+            return False
 
     def _validate_selection_replacement_guard(self, corrected_text: str) -> str:
         target = self.last_output_target
@@ -1327,10 +1946,13 @@ class App:
         if not summary_input:
             return
         try:
-            result = self.analyzer.analyze_summary(summary_input)
+            result = self.analyzer.analyze_summary(
+                summary_input,
+                self.panel.get_summary_style(),
+            )
         except Exception as exc:
             self.panel.set_summary_result(f"OpenAI 요약 요청 실패:\n\n{exc}")
-            return
+            return ""
         self.panel.set_summary_result(result)
         self.save_history_log(
             feature_type=3,
@@ -1338,6 +1960,7 @@ class App:
             request_id=self.current_history_request_id,
             output_text=self._strip_result_heading(result),
         )
+        return result
 
     def _summary_input_text(self):
         corrected_text = str(self.last_corrected_text or "").strip()
@@ -1362,14 +1985,50 @@ class App:
             result = self.analyzer.analyze_evaluation(evaluation_input)
         except Exception as exc:
             self.panel.set_evaluation_score(f"평가 실패: {exc}")
-            return
+            return ""
         self.panel.set_evaluation_score(result)
         self.save_history_log(
             feature_type=1,
             input_text=self._history_source_text(),
             request_id=self.current_history_request_id,
+            output_text=result,
             score=self._parse_score(result),
         )
+        return result
+
+    def handle_word_overlay_evaluation_reason(self):
+        reader_name = str(getattr(self.word_main_overlay, "_last_reader_name", "") or "word")
+        if not self._refresh_overlay_input_for_reader(reader_name):
+            self.word_main_overlay.show_status("텍스트 없음", auto_hide_ms=1200)
+            return
+        evaluation_input = self._summary_input_text()
+        if not evaluation_input:
+            self.word_main_overlay.show_status("텍스트 없음", auto_hide_ms=1200)
+            return
+        self.word_main_overlay.show_busy("평가 이유 생성중")
+        self.add_word_overlay_notification("평가 이유 생성 시작")
+        QApplication.processEvents()
+        try:
+            score_text = self.panel.score_label.text()
+            reason = self.analyzer.analyze_evaluation_reason(evaluation_input, score_text)
+            self.word_main_overlay.show_text_result("평가 이유", reason)
+            self.save_history_log(
+                feature_type=1,
+                input_text=self._history_source_text(),
+                request_id=self.current_history_request_id,
+                output_text=score_text,
+                score=self._parse_score(score_text),
+                evaluation_reason=reason,
+            )
+            self.add_word_overlay_notification("평가 이유 생성 완료")
+        except Exception as exc:
+            self.word_main_overlay.show_status(f"평가 이유 실패: {exc}", auto_hide_ms=1800)
+            self.add_word_overlay_notification(
+                f"평가 이유 실패: {type(exc).__name__}",
+                error=True,
+            )
+        finally:
+            self.word_main_overlay.hide_busy()
 
     def run_title_recommendation(self):
         title_input = self._summary_input_text()
@@ -1379,7 +2038,7 @@ class App:
             result = self.analyzer.analyze_title_recommendation(title_input)
         except Exception as exc:
             self.panel.set_title_recommendation(f"제목 추천 실패: {exc}")
-            return
+            return ""
         self.panel.set_title_recommendation(result)
         self.save_history_log(
             feature_type=1,
@@ -1388,6 +2047,7 @@ class App:
             title=result,
             score=self._parse_score(self.panel.score_label.text()),
         )
+        return result
 
     def run_tone_change(self):
         tone_input = self._summary_input_text()
@@ -1421,6 +2081,7 @@ class App:
         score=None,
         tone=None,
         spelling_feedback=None,
+        evaluation_reason=None,
     ):
         if not input_text:
             return
@@ -1433,6 +2094,7 @@ class App:
             "score": score,
             "tone": tone,
             "spelling_feedback": spelling_feedback,
+            "evaluation_reason": evaluation_reason,
         }
         key = (
             payload["feature_type"],
@@ -1442,6 +2104,7 @@ class App:
             payload.get("score"),
             payload.get("tone") or "",
             payload.get("spelling_feedback") or "",
+            payload.get("evaluation_reason") or "",
         )
         if not self.is_logged_in() or not self.is_history_enabled():
             return
@@ -1474,6 +2137,7 @@ class App:
             payload.get("score"),
             payload.get("tone") or "",
             payload.get("spelling_feedback") or "",
+            payload.get("evaluation_reason") or "",
         )
         if key in self.last_local_log_keys:
             return
@@ -1804,6 +2468,10 @@ class App:
 
     def quit_app(self):
         self.reset_session_state()
+        if hasattr(self, "word_overlay_timer"):
+            self.word_overlay_timer.stop()
+        if hasattr(self, "word_main_overlay"):
+            self.word_main_overlay.hide_with_reason("quit_app")
         self.tray.hide()
         self.local_server.stop()
         self.qt_app.quit()

@@ -23,13 +23,17 @@ class AIClient:
             "corrected": str(data.get("corrected_text", "") or "").strip(),
         }
 
-    def summarize(self, text):
-        data = self._post("/summary", {"text": text}, timeout=120)
+    def summarize(self, text, style="brief"):
+        data = self._post("/summary", {"text": text, "style": style}, timeout=120)
         return str(data.get("summary_text", "") or "").strip()
 
     def evaluate(self, text):
         data = self._post("/evaluate", {"text": text}, timeout=120)
         return str(data.get("score_text", "") or "").strip()
+
+    def evaluate_reason(self, text, score_text=""):
+        data = self._post("/evaluate-reason", {"text": text, "score_text": score_text}, timeout=120)
+        return str(data.get("evaluation_reason", "") or "").strip()
 
     def recommend_title(self, text):
         data = self._post("/title", {"text": text}, timeout=120)

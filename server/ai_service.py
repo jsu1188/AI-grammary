@@ -74,13 +74,20 @@ class AIService:
             "spelling_feedback": spelling_feedback,
         }
 
-    def summarize_text(self, text: str) -> str:
+    def summarize_text(self, text: str, style: str = "brief") -> str:
+        style_instructions = {
+            "brief": "요약 방식: 짧게. 핵심만 1~3문장으로 간결하게 요약하세요.",
+            "bullet": "요약 방식: 핵심 bullet. 핵심 내용을 3~5개의 짧은 bullet로 정리하세요.",
+            "detailed": "요약 방식: 자세히. 중요한 맥락과 흐름을 보존하며 5~8문장 정도로 자세히 요약하세요.",
+        }
+        style_instruction = style_instructions.get(style, style_instructions["brief"])
         response = self.client.responses.create(
             model=self.model,
             instructions=(
                 "당신은 한국어 문서 요약 전문가입니다. "
                 "핵심 내용만 간결하게 요약하세요. "
-                "원문에 없는 사실은 추가하지 마세요."
+                "원문에 없는 사실은 추가하지 마세요. "
+                f"{style_instruction}"
             ),
             input=text,
         )
@@ -102,6 +109,18 @@ class AIService:
             return "0점"
         score = max(0, min(100, int(digits)))
         return f"{score}점"
+
+    def evaluate_reason(self, text: str, score_text: str = "") -> str:
+        response = self.client.responses.create(
+            model=self.model,
+            instructions=(
+                "당신은 한국어 글쓰기 평가 도우미입니다. "
+                "주어진 글과 점수를 바탕으로 평가 이유를 3~5문장으로 간단히 설명하세요. "
+                "명확성, 문법, 가독성 중심으로 설명하고 원문에 없는 사실은 추가하지 마세요."
+            ),
+            input=f"글:\n{text}\n\n점수:\n{score_text or '점수 없음'}\n\n평가 이유:",
+        )
+        return self._clean_output(response.output_text)
 
     def recommend_title(self, text: str) -> str:
         response = self.client.responses.create(

@@ -49,6 +49,7 @@ class CorrectResponse(BaseModel):
 
 class SummaryRequest(BaseModel):
     text: str
+    style: str = "brief"
 
 
 class SummaryResponse(BaseModel):
@@ -57,10 +58,15 @@ class SummaryResponse(BaseModel):
 
 class EvaluationRequest(BaseModel):
     text: str
+    score_text: str | None = None
 
 
 class EvaluationResponse(BaseModel):
     score_text: str
+
+
+class EvaluationReasonResponse(BaseModel):
+    evaluation_reason: str
 
 
 class TitleRequest(BaseModel):
@@ -124,6 +130,7 @@ class UsageLogCreateRequest(BaseModel):
     score: int | None = None
     tone: str | None = None
     spelling_feedback: str | None = None
+    evaluation_reason: str | None = None
 
 
 class UsageLogResponse(BaseModel):
@@ -136,6 +143,7 @@ class UsageLogResponse(BaseModel):
     score: int | None = None
     tone: str | None = None
     spelling_feedback: str | None = None
+    evaluation_reason: str | None = None
     created_at: datetime
 
     class Config:

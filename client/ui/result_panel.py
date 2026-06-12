@@ -5,6 +5,7 @@ from PyQt5.QtCore import QPoint, QRectF, QSize, Qt, QVariantAnimation, QTimer
 from PyQt5.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QFrame,
     QGraphicsOpacityEffect,
@@ -185,6 +186,8 @@ class ResultPanel(QWidget):
         header_layout.addLayout(title_block)
         header_layout.addStretch()
 
+        self.header_history_btn = self._create_history_button()
+
         self.login_btn = QPushButton("로그인")
         self.login_btn.setObjectName("secondaryButton")
 
@@ -202,14 +205,15 @@ class ResultPanel(QWidget):
         self.dark_mode_btn.setObjectName("secondaryButton")
         self.dark_mode_btn.setCheckable(True)
         self.dark_mode_btn.clicked.connect(self.toggle_theme)
+        self.dark_mode_btn.hide()
 
         self.hide_btn = QPushButton("숨기기")
         self.hide_btn.setObjectName("ghostButton")
         self.hide_btn.clicked.connect(self.hide)
 
+        header_layout.addWidget(self.header_history_btn)
         header_layout.addWidget(self.login_btn)
         header_layout.addWidget(self.settings_btn)
-        header_layout.addWidget(self.dark_mode_btn)
         header_layout.addWidget(self.hide_btn)
 
         self.tabs = QTabWidget()
@@ -242,6 +246,20 @@ class ResultPanel(QWidget):
         self.apply_correction_btn.setObjectName("primaryButton")
         self.apply_correction_btn.hide()
         self.spell_history_btn = self._create_history_button()
+        self.summary_style_group = QButtonGroup(self)
+        self.summary_style_group.setExclusive(True)
+        self.summary_style_buttons = {}
+        for style, label in (
+            ("brief", "짧게"),
+            ("bullet", "핵심 bullet"),
+            ("detailed", "자세히"),
+        ):
+            button = QPushButton(label)
+            button.setObjectName("scopeButton")
+            button.setCheckable(True)
+            self.summary_style_group.addButton(button)
+            self.summary_style_buttons[style] = button
+        self.summary_style_buttons["brief"].setChecked(True)
         self.run_summary_btn = QPushButton("글 요약")
         self.run_summary_btn.setObjectName("secondaryButton")
         self.summary_history_btn = self._create_history_button()
@@ -249,6 +267,7 @@ class ResultPanel(QWidget):
         self.run_tone_btn.setObjectName("secondaryButton")
         self.tone_history_btn = self._create_history_button()
         self.history_buttons = (
+            self.header_history_btn,
             self.text_history_btn,
             self.spell_history_btn,
             self.summary_history_btn,
@@ -336,7 +355,7 @@ class ResultPanel(QWidget):
         self.tone_input.setObjectName("toneInput")
         self.tone_input.setPlaceholderText("원하는 문체/말투")
 
-        self.default_dark_mode_checkbox = QCheckBox("기본 다크 모드")
+        self.default_dark_mode_checkbox = QCheckBox("화면 모드: 다크 모드 사용")
         self.default_dark_mode_checkbox.setObjectName("settingsCheck")
         self.clipboard_mode_checkbox = QCheckBox("클립보드 인식 사용")
         self.clipboard_mode_checkbox.setObjectName("settingsCheck")
@@ -364,10 +383,9 @@ class ResultPanel(QWidget):
 
         self.tabs.addTab(self._create_text_tab(), "텍스트")
         self.tabs.addTab(self._create_spell_tab(), "맞춤법")
-        self.tabs.addTab(self._create_action_tab(self.summary_box, self.run_summary_btn), "요약")
+        self.tabs.addTab(self._create_summary_tab(), "요약")
         self.tabs.addTab(self._create_tone_tab(), "문체/말투")
-        self.tabs.addTab(QWidget(), "기록")
-        self.history_tab_index = self.tabs.count() - 1
+        self.history_tab_index = -1
         self._last_non_history_tab_index = 0
         self._return_stack_index = 0
         self.tabs.currentChanged.connect(self._handle_tab_changed)
@@ -684,6 +702,33 @@ class ResultPanel(QWidget):
         button_row.setContentsMargins(0, 0, 8, 0)
         button_row.addStretch()
         button_row.addWidget(action_button)
+        layout.addLayout(button_row)
+        return page
+
+    def _create_summary_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(12)
+
+        style_row = QHBoxLayout()
+        style_row.setContentsMargins(0, 0, 0, 0)
+        style_row.setSpacing(8)
+        style_label = QLabel("요약 방식")
+        style_label.setObjectName("historyFieldLabel")
+        style_row.addWidget(style_label)
+        for style in ("brief", "bullet", "detailed"):
+            style_row.addWidget(self.summary_style_buttons[style])
+        style_row.addStretch()
+        layout.addLayout(style_row)
+
+        layout.addWidget(self.summary_box, 1)
+
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 8, 0)
+        button_row.addStretch()
+        button_row.addWidget(self.run_summary_btn)
+        button_row.addWidget(self.summary_history_btn)
         layout.addLayout(button_row)
         return page
 
@@ -1205,13 +1250,16 @@ class ResultPanel(QWidget):
     def _history_detail_fields(self, feature_type, log):
         created_at = self._format_created_at(log.get("created_at", ""))
         if feature_type == 1:
-            return [
+            fields = [
                 ("원본", log.get("input_text"), True),
                 ("원본 점수", log.get("score"), False),
                 ("추천 제목", log.get("title"), False),
                 ("종류", log.get("feature_type"), False),
                 ("저장 시간", created_at, False),
             ]
+            if log.get("evaluation_reason"):
+                fields.insert(2, ("평가 이유", log.get("evaluation_reason"), True))
+            return fields
         if feature_type == 2:
             return [
                 ("원본 글", log.get("input_text"), True),
@@ -1267,13 +1315,16 @@ class ResultPanel(QWidget):
             return self._request_history_detail_fields(log)
         created_at = self._format_created_at(log.get("created_at", ""))
         if feature_type == 1:
-            return [
+            fields = [
                 ("원본", log.get("input_text"), True),
                 ("원본 점수", log.get("score"), False),
                 ("추천 제목", log.get("title"), False),
                 ("종류", log.get("feature_type"), False),
                 ("저장 시간", created_at, False),
             ]
+            if log.get("evaluation_reason"):
+                fields.insert(2, ("평가 이유", log.get("evaluation_reason"), True))
+            return fields
         if feature_type == 2:
             return [
                 ("원본 글", log.get("input_text"), True),
@@ -1322,7 +1373,11 @@ class ResultPanel(QWidget):
             ])
         evaluation = log.get("evaluation") or {}
         if evaluation:
-            fields.extend([("점수", evaluation.get("score_text") or evaluation.get("score"), False)])
+            fields.extend([
+                ("점수", evaluation.get("score_text") or evaluation.get("score"), False),
+            ])
+            if evaluation.get("evaluation_reason"):
+                fields.extend([("평가 이유", evaluation.get("evaluation_reason"), True)])
         title = log.get("title") or {}
         if title:
             fields.extend([("추천 제목", title.get("title_text"), False)])
@@ -1647,6 +1702,21 @@ class ResultPanel(QWidget):
             QPushButton#secondaryButton:disabled {{
                 background: #e1e1e1;
                 color: #8a8a8a;
+            }}
+            QPushButton#scopeButton {{
+                background: {colors["button_bg"]};
+                color: {colors["button_text"]};
+                border-radius: 14px;
+                padding: 8px 14px;
+                font-size: 12px;
+                font-weight: 800;
+            }}
+            QPushButton#scopeButton:hover {{
+                background: {colors["button_hover"]};
+            }}
+            QPushButton#scopeButton:checked {{
+                background: {colors["accent"]};
+                color: {colors["accent_text"]};
             }}
             QPushButton#dangerButton {{
                 background: transparent;
@@ -2223,4 +2293,10 @@ class ResultPanel(QWidget):
         if current_tab == 3:
             return self.tone_box.toPlainText()
         return ""
+
+    def get_summary_style(self):
+        for style, button in self.summary_style_buttons.items():
+            if button.isChecked():
+                return style
+        return "brief"
 

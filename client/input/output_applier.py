@@ -286,6 +286,61 @@ class OutputApplier:
 
         self._apply_via_window_handle(target.window_handle, text, target.style_info)
 
+    def insert_hwp_title(self, window_handle: int | None, title_text: str):
+        clean_title = str(title_text or "").strip()
+        if not clean_title:
+            raise ValueError("제목이 비어 있습니다.")
+        if pythoncom is None:
+            raise RuntimeError("pywin32 is required for HWP title insertion.")
+        pythoncom.CoInitialize()
+        hwp = self._active_hwp_object(window_handle)
+        if hwp is None:
+            raise RuntimeError("No active HWP COM object is available.")
+        try:
+            try:
+                hwp.Run("Cancel")
+            except Exception:
+                pass
+            hwp.MovePos(2)
+            self._set_hwp_paragraph_alignment(hwp, "center")
+            self._insert_hwp_text(hwp, clean_title)
+            try:
+                hwp.Run("BreakPara")
+            except Exception:
+                self._insert_hwp_text(hwp, "\n")
+            self._set_hwp_paragraph_alignment(hwp, "left")
+            try:
+                hwp.Run("BreakPara")
+            except Exception:
+                self._insert_hwp_text(hwp, "\n")
+            self._log_hwp_replace(
+                f"HWP title inserted length={len(clean_title)} sample={clean_title[:80]!r}"
+            )
+        except Exception as exc:
+            self._log_hwp_replace(f"HWP title insert failed: {type(exc).__name__}: {exc}")
+            raise
+
+    def _set_hwp_paragraph_alignment(self, hwp, align: str):
+        command_candidates = {
+            "center": (
+                "ParagraphShapeAlignCenter",
+                "AlignCenter",
+            ),
+            "left": (
+                "ParagraphShapeAlignLeft",
+                "AlignLeft",
+            ),
+        }.get(str(align or "").lower(), ())
+        for command in command_candidates:
+            try:
+                hwp.Run(command)
+                self._log_hwp_replace(f"HWP paragraph align applied command={command!r}")
+                return True
+            except Exception:
+                continue
+        self._log_hwp_replace(f"HWP paragraph align skipped align={align!r}")
+        return False
+
     def _apply_to_browser_extension(self, text: str, style_info: dict | None = None):
         from client.input.browser_extension_bridge import get_browser_extension_bridge
 

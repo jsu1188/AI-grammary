@@ -8,10 +8,11 @@ import requests
 
 
 class LocalServer:
-    REQUIRED_API_VERSION = "openai-separated-v7"
+    REQUIRED_API_VERSION = "openai-separated-v8"
     REQUIRED_ROUTES = {
         "/correct",
         "/evaluate",
+        "/evaluate-reason",
         "/title",
         "/summary",
         "/tone",

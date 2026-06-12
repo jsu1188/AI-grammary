@@ -31,6 +31,7 @@ from schemas import (
     CorrectRequest,
     CorrectResponse,
     EvaluationRequest,
+    EvaluationReasonResponse,
     EvaluationResponse,
     HistoryRequestResponse,
     LoginRequest,
@@ -53,7 +54,7 @@ from schemas import (
 )
 
 
-SERVER_API_VERSION = "openai-separated-v7"
+SERVER_API_VERSION = "openai-separated-v8"
 
 app = FastAPI(title="AI 문서 보조 서버")
 Base.metadata.create_all(bind=engine)
@@ -69,6 +70,15 @@ def ensure_user_columns():
         return
     with engine.begin() as connection:
         connection.execute(text("ALTER TABLE users ADD COLUMN display_name VARCHAR(100)"))
+
+
+def ensure_evaluation_columns():
+    inspector = inspect(engine)
+    column_names = {column["name"] for column in inspector.get_columns("evaluation_results")}
+    if "evaluation_reason" in column_names:
+        return
+    with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE evaluation_results ADD COLUMN evaluation_reason TEXT"))
 
 
 def migrate_legacy_usage_logs():
@@ -161,6 +171,7 @@ def migrate_legacy_usage_logs():
 
 
 ensure_user_columns()
+ensure_evaluation_columns()
 migrate_legacy_usage_logs()
 
 
@@ -287,6 +298,7 @@ def serialize_evaluation_result(row: EvaluationResult) -> UsageLogResponse:
         score=row.score,
         tone=None,
         spelling_feedback=None,
+        evaluation_reason=row.evaluation_reason,
         created_at=row.created_at,
     )
 
@@ -366,6 +378,7 @@ def serialize_history_request(request_row: AnalysisRequest) -> HistoryRequestRes
             {
                 "score": evaluation_row.score,
                 "score_text": evaluation_row.score_text,
+                "evaluation_reason": evaluation_row.evaluation_reason,
                 "created_at": evaluation_row.created_at.isoformat(),
             }
             if evaluation_row
@@ -395,6 +408,7 @@ def server_info():
         "openai_routes": [
             "/correct",
             "/evaluate",
+            "/evaluate-reason",
             "/title",
             "/summary",
             "/tone",
@@ -535,6 +549,26 @@ def evaluate_text(data: EvaluationRequest):
     return EvaluationResponse(score_text=score_text)
 
 
+@app.post("/evaluate-reason", response_model=EvaluationReasonResponse)
+def evaluate_reason(data: EvaluationRequest):
+    if not data.text.strip():
+        raise HTTPException(status_code=400, detail="평가 이유를 만들 텍스트가 비어 있습니다.")
+
+    started_at = time.monotonic()
+    log_ai_request("start", "evaluate_reason", chars=len(data.text), lines=data.text.count("\n") + 1)
+    try:
+        service = get_ai_service()
+        reason = service.evaluate_reason(data.text, data.score_text or "")
+    except Exception as exc:
+        elapsed_ms = int((time.monotonic() - started_at) * 1000)
+        log_ai_request("fail", "evaluate_reason", elapsed_ms=elapsed_ms, error=repr(exc))
+        raise HTTPException(status_code=502, detail=f"OpenAI 평가 이유 요청 실패: {exc}") from exc
+
+    elapsed_ms = int((time.monotonic() - started_at) * 1000)
+    log_ai_request("done", "evaluate_reason", model=service.model, elapsed_ms=elapsed_ms, output_chars=len(reason))
+    return EvaluationReasonResponse(evaluation_reason=reason)
+
+
 @app.post("/title", response_model=TitleResponse)
 def recommend_title(data: TitleRequest):
     if not data.text.strip():
@@ -561,10 +595,16 @@ def summarize_text(data: SummaryRequest):
         raise HTTPException(status_code=400, detail="요약할 텍스트가 비어 있습니다.")
 
     started_at = time.monotonic()
-    log_ai_request("start", "summary", chars=len(data.text), lines=data.text.count("\n") + 1)
+    log_ai_request(
+        "start",
+        "summary",
+        chars=len(data.text),
+        lines=data.text.count("\n") + 1,
+        style=data.style,
+    )
     try:
         service = get_ai_service()
-        summary_text = service.summarize_text(data.text)
+        summary_text = service.summarize_text(data.text, data.style)
     except Exception as exc:
         elapsed_ms = int((time.monotonic() - started_at) * 1000)
         log_ai_request("fail", "summary", elapsed_ms=elapsed_ms, error=repr(exc))
@@ -737,11 +777,13 @@ def create_usage_log(
                 request_id=request_row.id,
                 score=int(data.score) if data.score is not None else None,
                 score_text=data.output_text or (f"{int(data.score)}?" if data.score is not None else ""),
+                evaluation_reason=data.evaluation_reason,
             )
             db.add(row)
         else:
             row.score = int(data.score) if data.score is not None else row.score
             row.score_text = data.output_text or (f"{int(data.score)}?" if data.score is not None else row.score_text)
+            row.evaluation_reason = data.evaluation_reason if data.evaluation_reason is not None else row.evaluation_reason
             row.created_at = datetime.utcnow()
         db.commit()
         db.refresh(row)

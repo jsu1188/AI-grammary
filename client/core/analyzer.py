@@ -30,12 +30,15 @@ class TextAnalyzer:
             "spelling_feedback": feedback or self.TEMP_SPELLING_FEEDBACK,
         }
 
-    def analyze_summary(self, text):
-        result = self.summarize(text)
+    def analyze_summary(self, text, style="brief"):
+        result = self.summarize(text, style)
         return self.format_summary(result)
 
     def analyze_evaluation(self, text):
         return self.ai.evaluate(text)
+
+    def analyze_evaluation_reason(self, text, score_text=""):
+        return self.ai.evaluate_reason(text, score_text)
 
     def analyze_title_recommendation(self, text):
         return self.ai.recommend_title(text)
@@ -52,8 +55,8 @@ class TextAnalyzer:
     def check_spelling(self, text):
         return self.ai.correct_spelling(text)
 
-    def summarize(self, text):
-        return self.ai.summarize(text)
+    def summarize(self, text, style="brief"):
+        return self.ai.summarize(text, style)
 
     def format_spell_check(self, result):
         issues = ""

@@ -75,6 +75,7 @@ class EvaluationResult(Base):
     request_id = Column(Integer, ForeignKey("analysis_requests.id"), nullable=False, index=True)
     score = Column(Integer, nullable=True)
     score_text = Column(String(20), nullable=True)
+    evaluation_reason = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     request = relationship("AnalysisRequest", back_populates="evaluation_results")
