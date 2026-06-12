@@ -1,8 +1,11 @@
 import os
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 
@@ -57,9 +60,15 @@ from schemas import (
 
 SERVER_API_VERSION = "openai-separated-v8"
 DEFAULT_CLIENT_VERSION = "1.0.0"
+SERVER_DIR = Path(__file__).resolve().parent
+SITE_DIR = SERVER_DIR / "site"
+DOWNLOADS_DIR = SERVER_DIR / "downloads"
 
 app = FastAPI(title="AI 문서 보조 서버")
 Base.metadata.create_all(bind=engine)
+
+if SITE_DIR.exists():
+    app.mount("/site-assets", StaticFiles(directory=str(SITE_DIR)), name="site-assets")
 
 ai_service = None
 ai_service_key_fingerprint = None
@@ -397,7 +406,15 @@ def serialize_history_request(request_row: AnalysisRequest) -> HistoryRequestRes
     )
 
 
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
+def landing_page():
+    index_path = SITE_DIR / "index.html"
+    if index_path.exists():
+        return index_path.read_text(encoding="utf-8")
+    return "<h1>Checkword</h1><p>Landing page not found.</p>"
+
+
+@app.get("/api-status")
 def root():
     return {"message": "server is running", "api_version": SERVER_API_VERSION}
 
@@ -426,7 +443,8 @@ def server_info():
 def client_version():
     latest_version = (os.getenv("LATEST_CLIENT_VERSION") or DEFAULT_CLIENT_VERSION).strip()
     minimum_version = (os.getenv("MINIMUM_CLIENT_VERSION") or "").strip()
-    download_url = (os.getenv("LATEST_CLIENT_DOWNLOAD_URL") or "").strip()
+    default_download_url = (os.getenv("DEFAULT_PUBLIC_DOWNLOAD_URL") or "/download/checkword.zip").strip()
+    download_url = (os.getenv("LATEST_CLIENT_DOWNLOAD_URL") or default_download_url).strip()
     message = (
         os.getenv("LATEST_CLIENT_MESSAGE")
         or f"새 버전 {latest_version} 이(가) 준비되었습니다."
@@ -437,6 +455,18 @@ def client_version():
         "download_url": download_url,
         "message": message,
     }
+
+
+@app.get("/download/checkword.zip")
+def download_checkword_zip():
+    zip_path = DOWNLOADS_DIR / "Checkword.zip"
+    if not zip_path.exists():
+        raise HTTPException(status_code=404, detail="배포 파일을 찾을 수 없습니다.")
+    return FileResponse(
+        path=str(zip_path),
+        media_type="application/zip",
+        filename="Checkword.zip",
+    )
 
 
 @app.post("/signup")
