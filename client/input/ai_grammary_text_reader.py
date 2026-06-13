@@ -657,6 +657,7 @@ class ActiveWordReader(BasePollingReader):
         super().__init__(debug=debug)
         self._last_word_text = ""
         self._last_word_style_info: dict = {}
+        self._last_word_selection_signature: tuple[int, int, str] | None = None
 
     def _active_document(self):
         if pythoncom is None:
@@ -688,39 +689,53 @@ class ActiveWordReader(BasePollingReader):
         if pythoncom is None:
             return ""
         try:
+            if get_process_name(get_foreground_hwnd()) not in WORD_PROCESS_NAMES:
+                self._last_selection_info = {}
+                self._last_word_selection_signature = None
+                return ""
             pythoncom.CoInitialize()
             import win32com.client as win32
 
             word = win32.GetActiveObject("Word.Application")
             selection = getattr(word, "Selection", None)
             if selection is None:
+                self._last_selection_info = {}
+                self._last_word_selection_signature = None
                 return ""
             text = self._clean_word_paragraph_text(getattr(selection, "Text", "") or "")
             word_range = getattr(selection, "Range", None)
-            if text.strip() and word_range is not None:
-                selection_style_info = {}
-                try:
-                    selection_range = word_range.Duplicate
-                    if selection_range.End > selection_range.Start:
-                        # Trim trailing paragraph mark for style segmentation alignment.
-                        selection_range.End = selection_range.End - 1
-                    selection_style_info = self._style_from_range(selection_range)
-                    selection_style_info["segments"] = self._read_style_segments(selection_range)
-                except Exception:
-                    selection_style_info = {}
-                if selection_style_info:
-                    self._last_word_style_info = selection_style_info
-                self._last_selection_info = {
-                    "selection_mode": True,
-                    "selection_text": text.strip(),
-                    "word_selection_start": int(getattr(word_range, "Start", 0)),
-                    "word_selection_end": int(getattr(word_range, "End", 0)),
-                }
-            else:
+            if word_range is None:
                 self._last_selection_info = {}
+                self._last_word_selection_signature = None
+                return ""
+
+            selection_start = int(getattr(word_range, "Start", 0))
+            selection_end = int(getattr(word_range, "End", 0))
+            if selection_end <= selection_start or not text.strip():
+                self._last_selection_info = {}
+                self._last_word_selection_signature = None
+                return ""
+
+            self._last_word_selection_signature = (selection_start, selection_end, text)
+            self._last_selection_info = {
+                "selection_mode": True,
+                "selection_text": text.strip(),
+                "word_selection_start": selection_start,
+                "word_selection_end": selection_end,
+            }
+            self._last_word_style_info = {
+                "selection_mode": True,
+                "selection_text": text.strip(),
+                "word_selection_start": selection_start,
+                "word_selection_end": selection_end,
+                "segments": [],
+                "line_styles": [],
+            }
             return text.strip()
         except Exception as exc:
             self._debug(f"word selected read failed: {exc}")
+            self._last_selection_info = {}
+            self._last_word_selection_signature = None
             return ""
 
     def _read_paragraph_text(self, document) -> str:
@@ -759,15 +774,8 @@ class ActiveWordReader(BasePollingReader):
             if word_range.End > word_range.Start:
                 word_range.End = word_range.End - 1
             style_info = self._style_from_range(word_range)
-            style_info["line_styles"] = self._read_line_styles(document)
-            self._merge_word_openxml_underlines(document, style_info["line_styles"])
-            self._merge_word_openxml_strikes(document, style_info["line_styles"])
-            self._merge_word_openxml_vertical_aligns(document, style_info["line_styles"])
-            self._merge_word_openxml_highlights(document, style_info["line_styles"])
-            self._merge_word_openxml_colors(document, style_info["line_styles"])
-            style_info["segments"] = self._read_word_openxml_style_segments(document)
-            if not style_info["segments"] and self.ENABLE_WORD_LIVE_STYLE_SEGMENTS:
-                style_info["segments"] = self._read_style_segments(word_range)
+            style_info["line_styles"] = []
+            style_info["segments"] = []
             self._log_word_style(style_info)
             return style_info
         except Exception as exc:
@@ -1105,9 +1113,10 @@ class ActiveWordReader(BasePollingReader):
             "dashLongHeavy": 55,
         }.get(str(value), 1)
 
-    def _read_word_openxml_style_segments(self, document) -> list[dict]:
+    def _read_word_openxml_style_segments(self, source, include_uniform: bool = False) -> list[dict]:
         try:
-            root = ET.fromstring(getattr(document.Content, "WordOpenXML", "") or "")
+            word_range = getattr(source, "Content", source)
+            root = ET.fromstring(getattr(word_range, "WordOpenXML", "") or "")
         except Exception as exc:
             self._debug(f"word openxml style segment read failed: {exc}")
             return []
@@ -1125,7 +1134,7 @@ class ActiveWordReader(BasePollingReader):
                 for start, end, style in line_chunks
                 if end > start
             }
-            if len(signatures) > 1:
+            if include_uniform or len(signatures) > 1:
                 for start, end, style in line_chunks:
                     self._append_openxml_style_segment(segments, start, end, style)
             line_chunks = []
@@ -1705,8 +1714,10 @@ class ActiveHwpReader(BasePollingReader):
         return ""
 
     def _read_selected_text_via_hwpml2x(self, hwp) -> str:
-        text = self._read_hwpml2x_text(hwp, "selection")
-        if has_text_content(text):
+        for option in ("saveblock", "selection"):
+            text = self._read_hwpml2x_text(hwp, option)
+            if not has_text_content(text):
+                continue
             normalized = normalize_text(text).strip()
             full_text = normalize_text(self._last_hwp_text).strip()
             if not has_text_content(full_text):
@@ -1723,11 +1734,14 @@ class ActiveHwpReader(BasePollingReader):
                 )
                 if same_as_full or almost_full:
                     self._log_hwp(
-                        "HWP selection via HWPML2X rejected as full-document "
+                        f"HWP selection via HWPML2X option={option!r} rejected as full-document "
                         f"sel_len={len(normalized)} full_len={len(full_text)}"
                     )
-                    return ""
-            self._log_hwp(f"HWP selected text via HWPML2X length={len(text)} preview={text[:120]!r}")
+                    continue
+            self._log_hwp(
+                f"HWP selected text via HWPML2X option={option!r} "
+                f"length={len(text)} preview={text[:120]!r}"
+            )
             return text
         return ""
 
@@ -1736,13 +1750,16 @@ class ActiveHwpReader(BasePollingReader):
         if not normalized_selection:
             self._last_selection_info = {}
             return
-        full_text = normalize_text(self._last_hwp_text)
+        full_text = ""
+        try:
+            hwp = self._active_hwp()
+            com_full_text = normalize_text(self._read_text_via_hwp_com(hwp)) if hwp is not None else ""
+            if normalized_selection in com_full_text:
+                full_text = com_full_text
+        except Exception:
+            pass
         if not has_text_content(full_text):
-            try:
-                hwp = self._active_hwp()
-                full_text = self._read_text_via_hwp_com(hwp) if hwp is not None else ""
-            except Exception:
-                full_text = ""
+            full_text = normalize_text(self._last_hwp_text)
         normalized_full = normalize_text(full_text)
         start_index = normalized_full.find(normalized_selection)
         if start_index < 0:
@@ -2421,6 +2438,8 @@ class UniversalActiveTextReader:
         for reader in self.readers.values():
             if hasattr(reader, "_last_selection_info"):
                 reader._last_selection_info = {}
+            if hasattr(reader, "_last_word_selection_signature"):
+                reader._last_word_selection_signature = None
 
     def _reader_order_for_foreground(self) -> list[tuple[str, BasePollingReader]]:
         hwnd = get_foreground_hwnd()

@@ -6,6 +6,7 @@ import html
 from dataclasses import dataclass
 from pathlib import Path
 import time
+import xml.etree.ElementTree as ET
 
 import pyperclip
 
@@ -89,6 +90,8 @@ class OutputTarget:
 
 
 class OutputApplier:
+    WORD_MIXED_VALUES = (None, 9999999, -9999999, 9999998, -9999998)
+
     def inspect_replace_availability(self, target: OutputTarget | None) -> tuple[bool, str | None]:
         if target is None:
             return False, "No source window has been captured yet."
@@ -108,6 +111,57 @@ class OutputApplier:
                 return True, None
             return False, "The original HWP window is no longer available."
         return False, f"Replace mode is not supported for {target.mode}."
+
+    def prepare_word_style_runs(self, target: OutputTarget | None, source_text: str) -> dict:
+        style_info = dict((target.style_info or {}) if target else {})
+        if not target or target.mode != "word":
+            return style_info
+        if not style_info.get("selection_mode"):
+            self._log_word_replace("Word style refresh skipped: only selection mode captures style runs")
+            return style_info
+        try:
+            pythoncom.CoInitialize()
+            import win32com.client as win32
+
+            word = win32.GetActiveObject("Word.Application")
+            document = getattr(word, "ActiveDocument", None)
+            if document is None:
+                return style_info
+            word_range = None
+            start = style_info.get("word_selection_start")
+            end = style_info.get("word_selection_end")
+            if start is not None and end is not None and int(end) > int(start):
+                word_range = document.Range(int(start), int(end))
+            if word_range is None:
+                selection = getattr(word, "Selection", None)
+                word_range = getattr(selection, "Range", None) if selection is not None else None
+            if word_range is None:
+                return style_info
+            if word_range.End > word_range.Start:
+                word_range.End = word_range.End - 1
+            char_count = max(0, int(getattr(word_range, "End", 0)) - int(getattr(word_range, "Start", 0)))
+            self._log_word_replace(f"Word style refresh start chars={char_count}")
+            segments = self._capture_word_openxml_style_segments(word_range)
+            if not segments:
+                base_style = self._capture_word_style(word_range)
+                if base_style:
+                    source_len = len(str(source_text or ""))
+                    segments = [{"start": 0, "end": source_len, "style": base_style}]
+            if segments:
+                style_info["segments"] = segments
+                self._log_word_replace(
+                    f"Word style runs refreshed before mapping count={len(segments)} "
+                    f"selection={bool(style_info.get('selection_mode'))}"
+                )
+            if source_text:
+                if style_info.get("selection_mode"):
+                    style_info["selection_text"] = str(source_text)
+                else:
+                    style_info["_source_text"] = str(source_text)
+            return style_info
+        except Exception as exc:
+            self._log_word_replace(f"Word style refresh failed: {type(exc).__name__}: {exc}")
+            return style_info
 
     def prepare_hwp_selection_style_runs(self, target: OutputTarget | None, source_text: str) -> dict:
         style_info = dict((target.style_info or {}) if target else {})
@@ -186,6 +240,74 @@ class OutputApplier:
                     "text": corrected[start:end],
                 }
             )
+        return mapped_segments
+
+    def remap_word_segments(self, style_info: dict, source_text: str, corrected_text: str) -> list[dict]:
+        base_segments = list((style_info or {}).get("segments") or [])
+        corrected = str(corrected_text or "")
+        if not base_segments or not corrected:
+            return []
+
+        remapped = self._remap_style_segments(
+            str(source_text or ""),
+            corrected,
+            base_segments,
+            preserve_word_style=True,
+        )
+        if not remapped:
+            return []
+
+        # Word's inline replacement rebuilds text from these runs, so every
+        # corrected character, including paragraph marks, must belong to a run.
+        styles: list[dict | None] = [None] * len(corrected)
+        for segment in remapped:
+            try:
+                start = max(0, min(len(corrected), int(segment.get("start", 0))))
+                end = max(0, min(len(corrected), int(segment.get("end", 0))))
+            except Exception:
+                continue
+            if end <= start:
+                continue
+            style = dict(segment.get("style") or {})
+            if not style:
+                continue
+            for index in range(start, end):
+                styles[index] = style
+
+        last_style = None
+        for index, style in enumerate(styles):
+            if style is not None:
+                last_style = style
+            elif last_style is not None:
+                styles[index] = last_style
+        next_style = None
+        for index in range(len(styles) - 1, -1, -1):
+            style = styles[index]
+            if style is not None:
+                next_style = style
+            elif next_style is not None:
+                styles[index] = next_style
+        if not any(styles):
+            return []
+
+        mapped_segments: list[dict] = []
+        run_start = 0
+        run_style = styles[0] or {}
+        for index in range(1, len(styles) + 1):
+            style = styles[index] if index < len(styles) else None
+            if index < len(styles) and style == run_style:
+                continue
+            if run_style and index > run_start:
+                mapped_segments.append(
+                    {
+                        "start": run_start,
+                        "end": index,
+                        "style": dict(run_style),
+                        "text": corrected[run_start:index],
+                    }
+                )
+            run_start = index
+            run_style = style or {}
         return mapped_segments
 
     def apply(self, target: OutputTarget | None, text: str):
@@ -434,9 +556,15 @@ class OutputApplier:
                 word_range = getattr(selection, "Range", None) if selection is not None else None
             if word_range is None:
                 raise RuntimeError("No active Word selection is available.")
+            if self._apply_word_openxml_replacement(word_range, text):
+                return
+            if self._apply_word_paragraph_text_replacement(word_range, text):
+                return
             if style_info.get("segments_mapped") and (style_info.get("segments") or []):
-                if self._apply_word_selection_runs_with_inline_style(document, word_range, style_info.get("segments") or [], text):
-                    return
+                raise RuntimeError(
+                    "Word style-preserving replacement failed before fallback. "
+                    "RTF fallback was blocked because it does not preserve Word paragraph/layout styles."
+                )
             replacement_text = self._word_text_for_write(text)
             replacement_start = int(getattr(word_range, "Start", 0))
             captured_style = self._capture_word_style(word_range)
@@ -449,6 +577,11 @@ class OutputApplier:
                 self._log_word_replace(f"selection style restore failed: {type(exc).__name__}: {exc}")
             return
 
+        if style_info.get("segments_mapped") and (style_info.get("segments") or []):
+            word_range = document.Content.Duplicate
+            if self._apply_word_rtf_replacement(word_range, style_info.get("segments") or [], text):
+                return
+
         document.Content.Text = self._word_text_for_write(text)
         if line_styles:
             self._clear_word_direct_character_styles(document)
@@ -456,6 +589,216 @@ class OutputApplier:
         else:
             self._apply_word_style(document.Content, style_info)
         self._apply_word_style_segments(document, style_info.get("segments") or [])
+
+    def _apply_word_openxml_replacement(self, word_range, replacement_text: str) -> bool:
+        try:
+            source_xml = getattr(word_range, "WordOpenXML", "") or ""
+        except Exception as exc:
+            self._log_word_replace(f"word OpenXML replacement skipped: read failed {type(exc).__name__}: {exc}")
+            return False
+        if not source_xml:
+            self._log_word_replace("word OpenXML replacement skipped: empty source xml")
+            return False
+        rich_xml = self._build_word_openxml_text_replacement(source_xml, replacement_text)
+        if not rich_xml:
+            self._log_word_replace("word OpenXML replacement skipped: build failed")
+            return False
+        try:
+            word_range.Select()
+            app = getattr(word_range, "Application", None)
+            selection = getattr(app, "Selection", None) if app is not None else None
+            if selection is not None:
+                selection.InsertXML(rich_xml)
+            else:
+                word_range.InsertXML(rich_xml)
+            self._log_word_replace(
+                f"word OpenXML replacement success text_len={len(str(replacement_text or ''))}"
+            )
+            return True
+        except Exception as exc:
+            self._log_word_replace(f"word OpenXML replacement failed: {type(exc).__name__}: {exc}")
+            return False
+
+    def _apply_word_paragraph_text_replacement(self, word_range, replacement_text: str) -> bool:
+        try:
+            paragraphs = word_range.Paragraphs
+            paragraph_count = int(paragraphs.Count)
+        except Exception as exc:
+            self._log_word_replace(f"word paragraph replacement skipped: paragraphs unavailable {type(exc).__name__}: {exc}")
+            return False
+        if paragraph_count <= 0:
+            return False
+
+        replacement_lines = self._normalize_text(replacement_text).split("\n")
+        paragraph_jobs: list[tuple[int, int, str]] = []
+        for index in range(1, paragraph_count + 1):
+            try:
+                paragraph_range = paragraphs.Item(index).Range.Duplicate
+                start = int(getattr(paragraph_range, "Start", 0))
+                end = int(getattr(paragraph_range, "End", 0))
+            except Exception:
+                continue
+            if end > start:
+                end -= 1  # keep the paragraph mark, so paragraph formatting survives
+            if index - 1 < len(replacement_lines):
+                line_text = replacement_lines[index - 1]
+            elif index == paragraph_count and len(replacement_lines) > paragraph_count:
+                line_text = "\n".join(replacement_lines[index - 1 :])
+            else:
+                line_text = ""
+            paragraph_jobs.append((start, end, line_text))
+
+        if not paragraph_jobs:
+            return False
+
+        try:
+            document = getattr(word_range, "Document", None)
+            if document is None:
+                return False
+            # Replace from bottom to top so earlier paragraph ranges do not shift.
+            for start, end, line_text in reversed(paragraph_jobs):
+                target_range = document.Range(Start=start, End=end)
+                target_range.Text = self._word_text_for_write(line_text).replace("\r", "\v")
+            self._log_word_replace(
+                f"word paragraph replacement success paragraphs={len(paragraph_jobs)} "
+                f"text_len={len(str(replacement_text or ''))}"
+            )
+            return True
+        except Exception as exc:
+            self._log_word_replace(f"word paragraph replacement failed: {type(exc).__name__}: {exc}")
+            return False
+
+    def _build_word_openxml_text_replacement(self, source_xml: str, replacement_text: str) -> str:
+        try:
+            root = ET.fromstring(source_xml)
+        except Exception as exc:
+            self._log_word_replace(f"word OpenXML build parse failed: {type(exc).__name__}: {exc}")
+            return ""
+
+        namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        self._register_word_openxml_namespaces()
+        self._remove_word_openxml_insert_blockers(root, namespace)
+        paragraphs = root.findall(".//w:body/w:p", namespace)
+        if not paragraphs:
+            self._log_word_replace("word OpenXML build failed: no paragraphs")
+            return ""
+
+        replacement_lines = self._normalize_text(replacement_text).split("\n")
+        if not replacement_lines:
+            replacement_lines = [""]
+
+        for index, paragraph in enumerate(paragraphs):
+            if index < len(replacement_lines):
+                line_text = replacement_lines[index]
+            elif index == len(paragraphs) - 1 and len(replacement_lines) > len(paragraphs):
+                line_text = "\n".join(replacement_lines[index:])
+            else:
+                line_text = ""
+            self._assign_word_openxml_paragraph_text(paragraph, line_text, namespace)
+
+        return ET.tostring(root, encoding="unicode")
+
+    def _register_word_openxml_namespaces(self):
+        namespaces = {
+            "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+            "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+            "m": "http://schemas.openxmlformats.org/officeDocument/2006/math",
+            "v": "urn:schemas-microsoft-com:vml",
+            "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+            "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+            "pic": "http://schemas.openxmlformats.org/drawingml/2006/picture",
+            "w14": "http://schemas.microsoft.com/office/word/2010/wordml",
+            "w15": "http://schemas.microsoft.com/office/word/2012/wordml",
+            "mc": "http://schemas.openxmlformats.org/markup-compatibility/2006",
+        }
+        for prefix, uri in namespaces.items():
+            try:
+                ET.register_namespace(prefix, uri)
+            except Exception:
+                pass
+
+    def _remove_word_openxml_insert_blockers(self, root, namespace: dict):
+        blocked_tags = {
+            self._word_xml_name("sectPr"),
+        }
+        for parent in list(root.iter()):
+            for child in list(parent):
+                if child.tag in blocked_tags:
+                    parent.remove(child)
+
+    def _assign_word_openxml_paragraph_text(self, paragraph, line_text: str, namespace: dict):
+        text_nodes = paragraph.findall(".//w:t", namespace)
+        if not text_nodes:
+            run = paragraph.find("w:r", namespace)
+            if run is None:
+                run = ET.SubElement(paragraph, self._word_xml_name("r"))
+            text_node = ET.SubElement(run, self._word_xml_name("t"))
+            self._set_word_text_node(text_node, line_text)
+            return
+
+        remaining = str(line_text or "")
+        for index, text_node in enumerate(text_nodes):
+            original = text_node.text or ""
+            if index == len(text_nodes) - 1:
+                chunk = remaining
+            else:
+                chunk = remaining[: len(original)]
+                remaining = remaining[len(original):]
+            self._set_word_text_node(text_node, chunk)
+
+    def _set_word_text_node(self, text_node, text: str):
+        text_node.text = str(text or "")
+        space_attr = self._word_xml_space_name()
+        if text_node.text.startswith(" ") or text_node.text.endswith(" "):
+            text_node.set(space_attr, "preserve")
+        elif space_attr in text_node.attrib:
+            del text_node.attrib[space_attr]
+
+    def _word_xml_name(self, local_name: str) -> str:
+        return "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}" + local_name
+
+    def _word_xml_space_name(self) -> str:
+        return "{http://www.w3.org/XML/1998/namespace}space"
+
+    def _apply_word_rtf_replacement(self, word_range, mapped_segments: list[dict], replacement_text: str) -> bool:
+        if win32clipboard is None or win32con is None:
+            self._log_word_replace("word RTF replacement skipped: clipboard dependency unavailable")
+            return False
+        rtf_payload = self._build_rich_selection_rtf(
+            replacement_text,
+            mapped_segments,
+            style_mode="word",
+        )
+        if not rtf_payload:
+            self._log_word_replace("word RTF replacement skipped: empty payload")
+            return False
+        original_clipboard = self._read_clipboard_safely()
+        try:
+            self._set_rtf_clipboard(rtf_payload, self._word_text_for_write(replacement_text))
+            word_range.Select()
+            try:
+                app = getattr(word_range, "Application", None)
+                selection = getattr(app, "Selection", None) if app is not None else None
+                if selection is not None:
+                    selection.Paste()
+                else:
+                    word_range.Paste()
+            except Exception:
+                _Application, send_keys = self._load_pywinauto()
+                if send_keys is None:
+                    raise
+                send_keys("^v")
+            time.sleep(0.08)
+            self._log_word_replace(
+                f"word RTF replacement success runs={len(mapped_segments)} text_len={len(str(replacement_text or ''))}"
+            )
+            return True
+        except Exception as exc:
+            self._log_word_replace(f"word RTF replacement failed: {type(exc).__name__}: {exc}")
+            return False
+        finally:
+            if original_clipboard is not None:
+                self._copy_clipboard_safely(original_clipboard)
 
     def _apply_word_selection_runs_with_inline_style(self, document, selection_range, segments: list[dict], fallback_text: str) -> bool:
         try:
@@ -658,6 +1001,192 @@ class OutputApplier:
                 self._apply_word_style(segment_range, segment.get("style") or {})
             except Exception:
                 pass
+
+    def _capture_word_style_segments(self, word_range) -> list[dict]:
+        try:
+            characters = word_range.Characters
+            count = int(characters.Count)
+        except Exception:
+            return []
+        if count <= 0:
+            return []
+        max_count = min(count, 4000)
+        segments: list[dict] = []
+        current_signature = None
+        current_style = None
+        segment_start = 0
+        text_index = 0
+        for index in range(1, max_count + 1):
+            try:
+                char_range = characters.Item(index)
+                raw_text = getattr(char_range, "Text", "") or ""
+            except Exception:
+                continue
+            normalized = str(raw_text or "").replace("\r\n", "\n").replace("\r", "\n").replace("\x07", "")
+            if not normalized:
+                continue
+            style = self._capture_word_style(char_range)
+            signature = tuple(sorted((style or {}).items()))
+            char_len = len(normalized)
+            if current_signature is None:
+                current_signature = signature
+                current_style = style
+                segment_start = text_index
+            elif signature != current_signature:
+                if current_style and text_index > segment_start:
+                    segments.append({"start": segment_start, "end": text_index, "style": dict(current_style)})
+                current_signature = signature
+                current_style = style
+                segment_start = text_index
+            text_index += char_len
+        if current_style and text_index > segment_start:
+            segments.append({"start": segment_start, "end": text_index, "style": dict(current_style)})
+        return segments
+
+    def _capture_word_openxml_style_segments(self, word_range) -> list[dict]:
+        try:
+            root = ET.fromstring(getattr(word_range, "WordOpenXML", "") or "")
+        except Exception as exc:
+            self._log_word_replace(f"Word OpenXML style capture failed: {type(exc).__name__}: {exc}")
+            return []
+        namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        paragraphs = root.findall(".//w:body/w:p", namespace)
+        segments: list[dict] = []
+        text_index = 0
+
+        for paragraph in paragraphs:
+            for run in paragraph.findall("w:r", namespace):
+                style = self._word_openxml_run_style(run, namespace)
+                for part_text, is_break in self._word_openxml_run_text_parts(run):
+                    if is_break:
+                        text_index += 1
+                        continue
+                    if not part_text:
+                        continue
+                    start = text_index
+                    text_index += len(part_text)
+                    self._append_word_openxml_segment(segments, start, text_index, style)
+            text_index += 1
+        self._log_word_replace(f"Word OpenXML style capture count={len(segments)}")
+        return segments
+
+    def _append_word_openxml_segment(self, segments: list[dict], start: int, end: int, style: dict):
+        if end <= start:
+            return
+        clean_style = {key: value for key, value in (style or {}).items() if value is not None}
+        if not clean_style:
+            return
+        signature = tuple(sorted(clean_style.items()))
+        if segments:
+            last = segments[-1]
+            if last.get("end") == start and tuple(sorted((last.get("style") or {}).items())) == signature:
+                last["end"] = end
+                return
+        segments.append({"start": start, "end": end, "style": clean_style})
+
+    def _word_openxml_run_text_parts(self, run):
+        for child in list(run):
+            tag = str(child.tag).rsplit("}", 1)[-1]
+            if tag == "t":
+                yield child.text or "", False
+            elif tag == "tab":
+                yield "\t", False
+            elif tag in {"br", "cr"}:
+                yield "\n", True
+
+    def _word_openxml_run_style(self, run, namespace) -> dict:
+        run_props = run.find("w:rPr", namespace)
+        style = {
+            "bold": False,
+            "italic": False,
+            "underline": 0,
+            "strike_through": False,
+            "double_strike_through": False,
+            "subscript": False,
+            "superscript": False,
+            "highlight_color_index": 0,
+            "color_hex": "#000000",
+        }
+        if run_props is None:
+            return style
+        style["bold"] = self._word_openxml_toggle_enabled(run_props.find("w:b", namespace))
+        style["italic"] = self._word_openxml_toggle_enabled(run_props.find("w:i", namespace))
+        underline = run_props.find("w:u", namespace)
+        if underline is not None:
+            underline_value = self._word_openxml_attr(underline, "val") or "single"
+            style["underline"] = 0 if underline_value == "none" else 1
+            underline_color = self._word_openxml_color_hex(self._word_openxml_attr(underline, "color"))
+            if underline_color:
+                style["underline_color_hex"] = underline_color
+        if self._word_openxml_toggle_enabled(run_props.find("w:dstrike", namespace)):
+            style["double_strike_through"] = True
+            style["strike_through"] = False
+        elif self._word_openxml_toggle_enabled(run_props.find("w:strike", namespace)):
+            style["strike_through"] = True
+            style["double_strike_through"] = False
+        vertical_align = run_props.find("w:vertAlign", namespace)
+        vertical_value = self._word_openxml_attr(vertical_align, "val") if vertical_align is not None else None
+        if vertical_value == "subscript":
+            style["subscript"] = True
+        elif vertical_value == "superscript":
+            style["superscript"] = True
+        highlight = run_props.find("w:highlight", namespace)
+        if highlight is not None:
+            highlight_value = self._word_openxml_attr(highlight, "val")
+            if highlight_value:
+                style["highlight_color_index"] = self._word_openxml_highlight_value(highlight_value)
+        color = run_props.find("w:color", namespace)
+        if color is not None:
+            color_hex = self._word_openxml_color_hex(self._word_openxml_attr(color, "val"))
+            if color_hex:
+                style["color_hex"] = color_hex
+        return style
+
+    def _word_openxml_attr(self, element, name: str):
+        if element is None:
+            return None
+        for key, value in element.attrib.items():
+            if str(key).endswith("}" + name) or str(key) == name:
+                return value
+        return None
+
+    def _word_openxml_toggle_enabled(self, element) -> bool:
+        if element is None:
+            return False
+        value = self._word_openxml_attr(element, "val")
+        return str(value).lower() not in {"0", "false", "off", "none"}
+
+    def _word_openxml_color_hex(self, value):
+        if not value:
+            return None
+        raw = str(value).strip()
+        if raw.lower() == "auto" or len(raw) != 6:
+            return None
+        try:
+            int(raw, 16)
+        except Exception:
+            return None
+        return f"#{raw.upper()}"
+
+    def _word_openxml_highlight_value(self, value):
+        return {
+            "black": 1,
+            "blue": 2,
+            "cyan": 3,
+            "green": 4,
+            "magenta": 5,
+            "red": 6,
+            "yellow": 7,
+            "white": 8,
+            "darkBlue": 9,
+            "darkCyan": 10,
+            "darkGreen": 11,
+            "darkMagenta": 12,
+            "darkRed": 13,
+            "darkYellow": 14,
+            "darkGray": 15,
+            "lightGray": 16,
+        }.get(str(value), 0)
 
     def _apply_word_style(self, word_range, style_info: dict):
         if not style_info:
@@ -1457,10 +1986,26 @@ class OutputApplier:
     def _apply_hwp_saved_selection_replacement(self, hwp, replacement_text: str, style_info: dict):
         mapped_segments = style_info.get("segments") or []
         if style_info.get("segments_mapped") and mapped_segments:
+            if self._apply_hwp_saved_selection_segmented_replacement(
+                hwp,
+                replacement_text,
+                style_info,
+            ):
+                self._log_hwp_replace(
+                    "HWP selected replacement committed via block-scoped HWPML2X"
+                )
+                return
+            if style_info.get("hwp_selection_start_pos"):
+                raise RuntimeError(
+                    "HWP selected block replacement was stopped because its paragraph structure "
+                    "could not be preserved safely."
+                )
             if self._apply_hwp_selected_rtf_replacement(replacement_text, mapped_segments):
                 self._log_hwp_replace("HWP selected replacement committed via RTF clipboard")
                 return
-            self._log_hwp_replace("HWP selected RTF replacement failed; falling back to text plus style replay")
+            self._log_hwp_replace(
+                "HWP selected RTF replacement failed; falling back to text plus style replay"
+            )
         # Do not use HWPML2X SetTextFile for selected ranges. In HWP it can
         # report a text match while replacing content outside the user's block.
         self._apply_hwp_selected_text_replacement(hwp, replacement_text)
@@ -1572,17 +2117,25 @@ class OutputApplier:
                 self._copy_clipboard_safely(original_clipboard)
 
     def _build_hwp_selection_rtf(self, replacement_text: str, mapped_segments: list[dict]) -> str:
+        return self._build_rich_selection_rtf(replacement_text, mapped_segments, style_mode="hwp")
+
+    def _build_rich_selection_rtf(
+        self,
+        replacement_text: str,
+        mapped_segments: list[dict],
+        style_mode: str = "hwp",
+    ) -> str:
         text = self._normalize_text(replacement_text)
         if not text:
             return ""
-        runs = self._style_runs_for_rich_clipboard(text, mapped_segments)
+        runs = self._style_runs_for_rich_clipboard(text, mapped_segments, style_mode=style_mode)
         fonts: list[str] = []
         colors: list[int] = []
         for _start, _end, style in runs:
             font_name = str(style.get("font_name") or "").strip()
             if font_name and font_name not in fonts:
                 fonts.append(font_name)
-            color = self._safe_hwp_int(style.get("color"))
+            color = self._rich_style_color(style)
             if color is not None and color not in colors:
                 colors.append(color)
         if not fonts:
@@ -1605,21 +2158,26 @@ class OutputApplier:
             font_size = self._safe_hwp_float(style.get("font_size"))
             if font_size:
                 controls.append(f"\\fs{int(round(font_size * 2))}")
-            color = self._safe_hwp_int(style.get("color"))
+            color = self._rich_style_color(style)
             if color is not None:
                 controls.append(f"\\cf{color_index.get(color, 0)}")
             if style.get("bold"):
                 controls.append("\\b")
             if style.get("italic"):
                 controls.append("\\i")
-            if self._safe_hwp_int(style.get("underline_type")):
+            if self._rich_style_underline_enabled(style):
                 controls.append("\\ul")
-            if self._safe_hwp_int(style.get("strikeout_type")):
+            if self._rich_style_strike_enabled(style):
                 controls.append("\\strike")
             body.append("{" + "".join(controls) + " " + self._rtf_escape_text(chunk) + "}")
         return "{\\rtf1\\ansi\\deff0" + font_table + color_table + "\\viewkind4\\uc1 " + "".join(body) + "}"
 
-    def _style_runs_for_rich_clipboard(self, text: str, mapped_segments: list[dict]) -> list[tuple[int, int, dict]]:
+    def _style_runs_for_rich_clipboard(
+        self,
+        text: str,
+        mapped_segments: list[dict],
+        style_mode: str = "hwp",
+    ) -> list[tuple[int, int, dict]]:
         runs: list[tuple[int, int, dict]] = []
         cursor = 0
         for segment in sorted(mapped_segments[:400], key=lambda item: int(item.get("start", 0) or 0)):
@@ -1632,7 +2190,14 @@ class OutputApplier:
                 continue
             if start > cursor:
                 runs.append((cursor, start, {}))
-            style = self._sanitize_hwp_style_info(segment.get("style") or {}, require_base=False)
+            if style_mode == "word":
+                style = {
+                    key: value
+                    for key, value in (segment.get("style") or {}).items()
+                    if value is not None
+                }
+            else:
+                style = self._sanitize_hwp_style_info(segment.get("style") or {}, require_base=False)
             for run_start, run_end in self._split_range_excluding_newlines(text, start, end):
                 run_style = {} if text[run_start:run_end] == "\n" else style
                 runs.append((run_start, run_end, run_style))
@@ -1640,6 +2205,25 @@ class OutputApplier:
         if cursor < len(text):
             runs.append((cursor, len(text), {}))
         return runs
+
+    def _rich_style_color(self, style: dict) -> int | None:
+        color = self._safe_hwp_int(style.get("color"))
+        if color is not None:
+            return color
+        return self._word_color_from_hex(style.get("color_hex"))
+
+    def _rich_style_underline_enabled(self, style: dict) -> bool:
+        underline_type = self._safe_hwp_int(style.get("underline_type"))
+        if underline_type:
+            return True
+        underline = self._word_underline_value(style.get("underline"))
+        return bool(underline)
+
+    def _rich_style_strike_enabled(self, style: dict) -> bool:
+        strikeout_type = self._safe_hwp_int(style.get("strikeout_type"))
+        if strikeout_type:
+            return True
+        return bool(style.get("strike_through") or style.get("double_strike_through"))
 
     def _split_range_excluding_newlines(self, text: str, start: int, end: int) -> list[tuple[int, int]]:
         ranges: list[tuple[int, int]] = []
@@ -1895,19 +2479,38 @@ class OutputApplier:
         end_pos = style_info.get("hwp_selection_end_pos")
         length = self._safe_hwp_int(style_info.get("hwp_selection_length"))
         mapped_segments = style_info.get("segments") or []
-        if not (start_pos and end_pos and length and mapped_segments):
-            self._log_hwp_replace("HWP segmented replacement skipped: missing selection bounds or segments")
+        if not mapped_segments:
+            self._log_hwp_replace("HWP segmented replacement skipped: missing segments")
             return False
+        has_bounds = bool(start_pos and end_pos and length)
+        if not has_bounds:
+            self._log_hwp_replace("HWP segmented replacement skipped: missing selection bounds")
+            return False
+        self._select_hwp_text_range(hwp, tuple(start_pos), tuple(end_pos), length)
         source_xml = self._get_hwp_textfile(hwp, "HWPML2X", "saveblock")
         if not source_xml:
             source_xml = self._get_hwp_textfile(hwp, "HWPML2X", "selection")
         if not source_xml:
             self._log_hwp_replace("HWP segmented replacement skipped: no selected HWPML2X")
             return False
+        source_text = str(
+            style_info.get("selection_text")
+            or style_info.get("_source_text")
+            or ""
+        )
+        captured_text = self._extract_hwpml2x_plain_text(source_xml)
+        if not self._selection_text_matches_expected(captured_text, source_text):
+            self._log_hwp_replace(
+                "HWP segmented replacement skipped: active block does not match saved source "
+                f"captured_len={len(self._normalize_text(captured_text).strip())} "
+                f"expected_len={len(self._normalize_text(source_text).strip())}"
+            )
+            return False
         rich_xml = self._build_hwpml2x_segmented_replacement(source_xml, replacement_text, mapped_segments)
         if not rich_xml:
             self._log_hwp_replace("HWP segmented replacement skipped: build failed")
             return False
+        self._select_hwp_text_range(hwp, tuple(start_pos), tuple(end_pos), length)
         return self._apply_hwpml2x_selection_xml(
             hwp,
             rich_xml,
@@ -2083,7 +2686,13 @@ class OutputApplier:
             return False
         return True
 
-    def _remap_style_segments(self, source_text: str, replacement_text: str, segments: list[dict]) -> list[dict]:
+    def _remap_style_segments(
+        self,
+        source_text: str,
+        replacement_text: str,
+        segments: list[dict],
+        preserve_word_style: bool = False,
+    ) -> list[dict]:
         source = self._normalize_text(source_text)
         target = self._normalize_text(replacement_text)
         if not source or not target or not segments:
@@ -2099,7 +2708,15 @@ class OutputApplier:
                 continue
             if end <= start:
                 continue
-            style = self._sanitize_hwp_style_info(segment.get("style") or {}, require_base=False)
+            raw_style = segment.get("style") or {}
+            if preserve_word_style:
+                style = {
+                    key: value
+                    for key, value in raw_style.items()
+                    if value is not None
+                }
+            else:
+                style = self._sanitize_hwp_style_info(raw_style, require_base=False)
             if not style:
                 continue
             for idx in range(start, end):
@@ -2256,12 +2873,11 @@ class OutputApplier:
         if not callable(setter):
             self._log_hwp_replace("HWP segmented replacement skipped: SetTextFile unavailable")
             return False
-        # For saved selection replacement, only use explicit block-aware options.
-        # The default option can replace more than the user's selection even when
-        # the XML itself came from saveblock.
+        # Only use explicit block-aware options for a saved selection.
         for option in ("saveblock", "selection"):
             for call_variant in ("three_args", "two_args"):
                 try:
+                    self._select_hwp_text_range(hwp, start_pos, end_pos, length)
                     if call_variant == "three_args":
                         result = setter(rich_xml, "HWPML2X", option)
                     else:

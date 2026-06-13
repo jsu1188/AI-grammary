@@ -1498,7 +1498,7 @@ class App:
                 )
             elif status == "skipped":
                 reason = style_map_info.get("reason") or ""
-                if reason:
+                if reason and reason != "local_structure_mode":
                     status_line = f"\n[서식 매핑 건너뜀: {reason}]"
             self.panel.set_spell_result(
                 previous_spell_text
@@ -1540,21 +1540,8 @@ class App:
             return {"status": "skipped", "reason": "target_missing"}
         if target.mode not in {"word", "hwp"}:
             return {"status": "skipped", "reason": "unsupported_mode"}
+
         style_info = target.style_info or {}
-        if target.mode == "hwp":
-            if style_info.get("selection_mode"):
-                prepared_style_info = self.get_output_applier().prepare_hwp_selection_style_runs(
-                    target,
-                    str(style_info.get("selection_text") or self.last_correction_source_text or self.last_input or ""),
-                )
-            else:
-                prepared_style_info = self.get_output_applier().prepare_hwp_full_document_style_runs(
-                    target,
-                    str(style_info.get("_source_text") or self.last_correction_source_text or self.last_input or ""),
-                )
-            if prepared_style_info:
-                target.style_info = dict(prepared_style_info)
-                style_info = target.style_info
         source_text = str(
             style_info.get("selection_text")
             or style_info.get("_source_text")
@@ -1564,87 +1551,69 @@ class App:
         )
         if not source_text.strip() or not str(corrected_text or "").strip():
             return {"status": "skipped", "reason": "source_or_corrected_empty"}
-        style_runs = style_info.get("segments") or []
-        if not style_runs:
-            return {"status": "skipped", "reason": "style_runs_empty"}
-        style_runs = self._enrich_style_runs_with_source_text(source_text, style_runs)
-        info = {
-            "status": "failed",
-            "source_chars": len(source_text),
-            "corrected_chars": len(str(corrected_text or "")),
-            "input_runs": len(style_runs),
-            "mapped_runs": 0,
-        }
-        if target.mode == "hwp":
-            try:
-                mapped_text_runs = self.analyzer.map_style_runs_by_slot(source_text, corrected_text, style_runs)
-            except Exception as exc:
-                if "404" in str(exc) or "Not Found" in str(exc):
-                    info["status"] = "unavailable"
-                else:
-                    info["status"] = "failed"
-                    info["reason"] = "api_slot_map_failed"
-                return info
-            mapped_runs = self._merge_slot_mapped_text_with_local_styles(
+
+        if target.mode == "word":
+            prepared_style_info = self.get_output_applier().prepare_word_style_runs(
+                target,
+                source_text,
+            )
+            if prepared_style_info:
+                target.style_info = dict(prepared_style_info)
+                style_info = target.style_info
+            mapped_runs = self.get_output_applier().remap_word_segments(
+                style_info,
+                source_text,
                 str(corrected_text or ""),
-                style_runs,
-                mapped_text_runs,
             )
             if not mapped_runs:
-                info["status"] = "failed"
-                info["reason"] = "api_slot_map_invalid"
-                return info
+                return {"status": "failed", "reason": "word_local_style_map_failed"}
             target.style_info = dict(style_info)
             target.style_info["segments"] = mapped_runs
             target.style_info["segments_mapped"] = True
-            target.style_info["mapping_mode"] = "hwp_api_slot_map"
-            info["mapped_corrected_text"] = self._rebuild_text_from_mapped_runs(
-                str(corrected_text or ""),
-                mapped_runs,
-            )
-            info["status"] = "ok"
-            info["mapped_runs"] = len(mapped_runs)
-            try:
-                preview = [str(run.get("text") or "") for run in mapped_runs[:10]]
-                self.append_result(
-                    "[서식 매핑 디버그] "
-                    f"mode=hwp_api_slot_map mapped_runs={len(mapped_runs)} preview={preview}"
+            target.style_info["mapping_mode"] = "word_local_sequence_map"
+            return {
+                "status": "ok",
+                "source_chars": len(source_text),
+                "corrected_chars": len(str(corrected_text or "")),
+                "input_runs": len(style_info.get("segments") or []),
+                "mapped_runs": len(mapped_runs),
+            }
+
+        if target.mode == "hwp":
+            if style_info.get("selection_mode"):
+                prepared_style_info = self.get_output_applier().prepare_hwp_selection_style_runs(
+                    target,
+                    source_text,
                 )
-            except Exception:
-                pass
-            return info
-        try:
-            mapped_text_runs = self.analyzer.map_style_runs(source_text, corrected_text, style_runs)
-        except Exception as exc:
-            if "404" in str(exc) or "Not Found" in str(exc):
-                info["status"] = "unavailable"
-                return info
-            info["status"] = "failed"
-            return info
-        mapped_runs = self._merge_mapped_text_with_local_styles(
-            str(corrected_text or ""),
-            style_runs,
-            mapped_text_runs,
-            source_text,
-        )
-        if not isinstance(mapped_runs, list) or not mapped_runs:
-            info["status"] = "failed"
-            return info
-        try:
-            preview = [str(run.get("text") or "") for run in mapped_runs[:10]]
-            self.append_result(
-                "[서식 매핑 디버그] "
-                f"mapped_runs={len(mapped_runs)} preview={preview}"
-            )
-        except Exception:
-            pass
-        target.style_info = dict(style_info)
-        target.style_info["segments"] = mapped_runs
-        target.style_info["segments_mapped"] = True
-        info["mapped_corrected_text"] = self._rebuild_text_from_mapped_runs(str(corrected_text or ""), mapped_runs)
-        info["status"] = "ok"
-        info["mapped_runs"] = len(mapped_runs)
-        return info
+            else:
+                prepared_style_info = self.get_output_applier().prepare_hwp_full_document_style_runs(
+                    target,
+                    source_text,
+                )
+            if prepared_style_info:
+                target.style_info = dict(prepared_style_info)
+                style_info = target.style_info
+
+            if style_info.get("selection_mode"):
+                mapped_runs = self.get_output_applier().remap_hwp_selection_segments(
+                    style_info,
+                    source_text,
+                    str(corrected_text or ""),
+                )
+                if not mapped_runs:
+                    return {"status": "failed", "reason": "local_style_map_failed"}
+                target.style_info["segments"] = mapped_runs
+                target.style_info["segments_mapped"] = True
+                target.style_info["mapping_mode"] = "hwp_local_sequence_map"
+                return {
+                    "status": "ok",
+                    "source_chars": len(source_text),
+                    "corrected_chars": len(str(corrected_text or "")),
+                    "input_runs": len(style_info.get("segments") or []),
+                    "mapped_runs": len(mapped_runs),
+                }
+
+        return {"status": "skipped", "reason": "local_structure_mode"}
 
     def _enrich_style_runs_with_source_text(self, source_text: str, runs: list[dict]) -> list[dict]:
         text = str(source_text or "")
@@ -1960,7 +1929,11 @@ class App:
         target = self.last_output_target
         if target and target.mode in {"notepad", "browser", "browser_extension", "word", "hwp"}:
             source_text = self.last_correction_source_text or self.last_input
-            restored = preserve_replacement_structure(source_text, text)
+            restored = preserve_replacement_structure(
+                source_text,
+                text,
+                strict_line_mapping=target.mode == "hwp",
+            )
             self._log_replacement_structure(source_text, text, restored, target.mode)
             return restored
         return text

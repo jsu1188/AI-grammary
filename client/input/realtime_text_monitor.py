@@ -46,7 +46,7 @@ def monitor_realtime_text(callback, poll_interval=0.25, debug=False, get_active_
 
     input_pause = _ForegroundInputPause()
 
-    selection_poll_interval = min(poll_interval, 0.08)
+    selection_poll_interval = max(poll_interval, 0.35)
     last_active_mode = None
 
     while True:

@@ -34,12 +34,22 @@ def preserve_blank_lines(original: str, replacement: str) -> str:
     return _join_like_original(original_text, original_newline, restored_lines)
 
 
-def preserve_replacement_structure(original: str, replacement: str) -> str:
+def preserve_replacement_structure(
+    original: str,
+    replacement: str,
+    *,
+    strict_line_mapping: bool = False,
+) -> str:
     """Preserve the original visible line layout as closely as possible."""
     original_text = str(original or "")
     replacement_text = str(replacement or "")
     if not original_text or not replacement_text:
         return replacement_text
+
+    if strict_line_mapping:
+        direct_restored = _restore_matching_line_layout(original_text, replacement_text)
+        if direct_restored is not None:
+            return direct_restored
 
     restored = preserve_blank_lines(original_text, replacement_text)
     if restored != replacement_text:
@@ -54,6 +64,27 @@ def preserve_replacement_structure(original: str, replacement: str) -> str:
         return content_restored
 
     return _restore_collapsed_marked_lines(original_text, replacement_text)
+
+
+def _restore_matching_line_layout(original: str, replacement: str) -> str | None:
+    original_lines = _normalize_newlines(original).split("\n")
+    replacement_lines = _normalize_newlines(replacement).split("\n")
+    # OpenAI sometimes emits Markdown hard-break spaces. They are not part of
+    # the corrected text and shift character-style alignment in rich editors.
+    replacement_content = [line.rstrip() for line in replacement_lines if not _is_blank(line)]
+    original_content_count = sum(1 for line in original_lines if not _is_blank(line))
+    if original_content_count != len(replacement_content):
+        return None
+
+    content_index = 0
+    restored_lines: list[str] = []
+    for original_line in original_lines:
+        if _is_blank(original_line):
+            restored_lines.append("")
+            continue
+        restored_lines.append(replacement_content[content_index])
+        content_index += 1
+    return _join_like_original(original, _dominant_newline(original), restored_lines)
 
 
 def _restore_paragraph_line_layout(original: str, replacement: str) -> str:
