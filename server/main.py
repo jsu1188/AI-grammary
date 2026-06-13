@@ -1,12 +1,14 @@
+import hashlib
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import inspect, text
+from sqlalchemy import distinct, func
 from sqlalchemy.orm import Session
 
 from ai_service import AIService
@@ -20,6 +22,7 @@ from auth import (
 from database import Base, SessionLocal, engine
 from models import (
     AnalysisRequest,
+    AnonymousUsageEvent,
     EvaluationResult,
     SpellingResult,
     SummaryResult,
@@ -60,6 +63,7 @@ from schemas import (
 
 SERVER_API_VERSION = "openai-separated-v8"
 DEFAULT_CLIENT_VERSION = "1.0.0"
+ANONYMOUS_ACTIVE_WINDOW_MINUTES = 5
 SERVER_DIR = Path(__file__).resolve().parent
 SITE_DIR = SERVER_DIR / "site"
 DOWNLOADS_DIR = SERVER_DIR / "downloads"
@@ -90,6 +94,21 @@ def ensure_evaluation_columns():
         return
     with engine.begin() as connection:
         connection.execute(text("ALTER TABLE evaluation_results ADD COLUMN evaluation_reason TEXT"))
+
+
+def ensure_anonymous_usage_columns():
+    inspector = inspect(engine)
+    table_names = set(inspector.get_table_names())
+    if "anonymous_usage_events" not in table_names:
+        return
+    column_names = {
+        column["name"]
+        for column in inspector.get_columns("anonymous_usage_events")
+    }
+    if "ip_address" in column_names:
+        return
+    with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE anonymous_usage_events ADD COLUMN ip_address VARCHAR(80)"))
 
 
 def migrate_legacy_usage_logs():
@@ -183,6 +202,7 @@ def migrate_legacy_usage_logs():
 
 ensure_user_columns()
 ensure_evaluation_columns()
+ensure_anonymous_usage_columns()
 migrate_legacy_usage_logs()
 
 
@@ -234,6 +254,68 @@ def get_current_user(
     if not user:
         raise HTTPException(status_code=401, detail="사용자를 찾을 수 없습니다.")
     return user
+
+
+def is_authorized_request(authorization: str = "") -> bool:
+    if not authorization.startswith("Bearer "):
+        return False
+    token = authorization.replace("Bearer ", "").strip()
+    payload = decode_access_token(token)
+    return bool(payload and payload.get("sub"))
+
+
+def get_request_ip(request: Request | None) -> str:
+    if request is None:
+        return ""
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",", 1)[0].strip()[:80]
+    for header_name in ("cf-connecting-ip", "x-real-ip"):
+        value = request.headers.get(header_name, "").strip()
+        if value:
+            return value[:80]
+    if request.client and request.client.host:
+        return str(request.client.host)[:80]
+    return ""
+
+
+def record_anonymous_usage(
+    db: Session,
+    feature: str,
+    anonymous_client_id: str = "",
+    app_version: str = "",
+    authorization: str = "",
+    request: Request | None = None,
+):
+    if is_authorized_request(authorization):
+        return
+    client_id = str(anonymous_client_id or "").strip()
+    version = str(app_version or "").strip()
+    ip_address = get_request_ip(request)
+    if not client_id and request is not None:
+        user_agent = request.headers.get("user-agent", "")
+        fingerprint_source = f"{ip_address}|{user_agent}"
+        if fingerprint_source.strip("|"):
+            digest = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()[:24]
+            client_id = f"legacy:{digest}"
+            version = version or "legacy"
+    if not client_id or len(client_id) > 80:
+        return
+    db.add(
+        AnonymousUsageEvent(
+            anonymous_client_id=client_id,
+            feature=str(feature or "unknown")[:40],
+            app_version=version[:40] or None,
+            ip_address=ip_address or None,
+        )
+    )
+    db.commit()
+
+
+def require_stats_access(x_admin_token: str = Header(default="")):
+    expected = os.getenv("ANONYMOUS_STATS_TOKEN", "").strip()
+    if expected and x_admin_token != expected:
+        raise HTTPException(status_code=403, detail="통계 조회 권한이 없습니다.")
 
 
 def get_or_create_request(db: Session, user_id: int, input_text: str) -> AnalysisRequest:
@@ -439,6 +521,78 @@ def server_info():
     }
 
 
+@app.get("/admin/anonymous-usage", dependencies=[Depends(require_stats_access)])
+def anonymous_usage_stats(db: Session = Depends(get_db)):
+    now = datetime.utcnow()
+    active_since = now - timedelta(minutes=ANONYMOUS_ACTIVE_WINDOW_MINUTES)
+    total_users = (
+        db.query(func.count(distinct(AnonymousUsageEvent.anonymous_client_id))).scalar()
+        or 0
+    )
+    active_users = (
+        db.query(func.count(distinct(AnonymousUsageEvent.anonymous_client_id)))
+        .filter(AnonymousUsageEvent.created_at >= active_since)
+        .scalar()
+        or 0
+    )
+    total_events = db.query(func.count(AnonymousUsageEvent.id)).scalar() or 0
+    total_ips = (
+        db.query(func.count(distinct(AnonymousUsageEvent.ip_address)))
+        .filter(AnonymousUsageEvent.ip_address.isnot(None))
+        .scalar()
+        or 0
+    )
+    feature_rows = (
+        db.query(AnonymousUsageEvent.feature, func.count(AnonymousUsageEvent.id))
+        .group_by(AnonymousUsageEvent.feature)
+        .order_by(func.count(AnonymousUsageEvent.id).desc())
+        .all()
+    )
+    version_rows = (
+        db.query(
+            AnonymousUsageEvent.app_version,
+            func.count(distinct(AnonymousUsageEvent.anonymous_client_id)),
+        )
+        .group_by(AnonymousUsageEvent.app_version)
+        .order_by(func.count(distinct(AnonymousUsageEvent.anonymous_client_id)).desc())
+        .all()
+    )
+    last_seen_rows = (
+        db.query(
+            AnonymousUsageEvent.anonymous_client_id,
+            func.max(AnonymousUsageEvent.created_at),
+            func.max(AnonymousUsageEvent.ip_address),
+        )
+        .group_by(AnonymousUsageEvent.anonymous_client_id)
+        .order_by(func.max(AnonymousUsageEvent.created_at).desc())
+        .limit(20)
+        .all()
+    )
+    return {
+        "total_anonymous_users": int(total_users),
+        "active_anonymous_users": int(active_users),
+        "active_window_minutes": ANONYMOUS_ACTIVE_WINDOW_MINUTES,
+        "total_anonymous_events": int(total_events),
+        "total_ip_addresses": int(total_ips),
+        "feature_counts": {
+            str(feature or "unknown"): int(count)
+            for feature, count in feature_rows
+        },
+        "version_user_counts": {
+            str(version or "unknown"): int(count)
+            for version, count in version_rows
+        },
+        "recent_clients": [
+            {
+                "anonymous_client_id": client_id,
+                "ip_address": ip_address,
+                "last_seen": last_seen.isoformat() if last_seen else None,
+            }
+            for client_id, last_seen, ip_address in last_seen_rows
+        ],
+    }
+
+
 @app.get("/client-version")
 def client_version():
     latest_version = (os.getenv("LATEST_CLIENT_VERSION") or DEFAULT_CLIENT_VERSION).strip()
@@ -557,7 +711,14 @@ def delete_account(current_user: User = Depends(get_current_user), db: Session =
 
 
 @app.post("/correct", response_model=CorrectResponse)
-def correct_text(data: CorrectRequest):
+def correct_text(
+    data: CorrectRequest,
+    request: Request,
+    authorization: str = Header(default=""),
+    x_anonymous_client_id: str = Header(default=""),
+    x_client_version: str = Header(default=""),
+    db: Session = Depends(get_db),
+):
     if not data.text.strip():
         raise HTTPException(status_code=400, detail="교정할 텍스트가 비어 있습니다.")
 
@@ -575,11 +736,19 @@ def correct_text(data: CorrectRequest):
     spelling_feedback = str(result.get("spelling_feedback", "") or "")
     elapsed_ms = int((time.monotonic() - started_at) * 1000)
     log_ai_request("done", "correct", model=service.model, elapsed_ms=elapsed_ms, output_chars=len(corrected_text))
+    record_anonymous_usage(db, "correct", x_anonymous_client_id, x_client_version, authorization, request)
     return CorrectResponse(corrected_text=corrected_text, spelling_feedback=spelling_feedback)
 
 
 @app.post("/evaluate", response_model=EvaluationResponse)
-def evaluate_text(data: EvaluationRequest):
+def evaluate_text(
+    data: EvaluationRequest,
+    request: Request,
+    authorization: str = Header(default=""),
+    x_anonymous_client_id: str = Header(default=""),
+    x_client_version: str = Header(default=""),
+    db: Session = Depends(get_db),
+):
     if not data.text.strip():
         raise HTTPException(status_code=400, detail="평가할 텍스트가 비어 있습니다.")
 
@@ -595,11 +764,19 @@ def evaluate_text(data: EvaluationRequest):
 
     elapsed_ms = int((time.monotonic() - started_at) * 1000)
     log_ai_request("done", "evaluate", model=service.model, elapsed_ms=elapsed_ms, output_chars=len(score_text))
+    record_anonymous_usage(db, "evaluate", x_anonymous_client_id, x_client_version, authorization, request)
     return EvaluationResponse(score_text=score_text)
 
 
 @app.post("/evaluate-reason", response_model=EvaluationReasonResponse)
-def evaluate_reason(data: EvaluationRequest):
+def evaluate_reason(
+    data: EvaluationRequest,
+    request: Request,
+    authorization: str = Header(default=""),
+    x_anonymous_client_id: str = Header(default=""),
+    x_client_version: str = Header(default=""),
+    db: Session = Depends(get_db),
+):
     if not data.text.strip():
         raise HTTPException(status_code=400, detail="평가 이유를 만들 텍스트가 비어 있습니다.")
 
@@ -615,11 +792,19 @@ def evaluate_reason(data: EvaluationRequest):
 
     elapsed_ms = int((time.monotonic() - started_at) * 1000)
     log_ai_request("done", "evaluate_reason", model=service.model, elapsed_ms=elapsed_ms, output_chars=len(reason))
+    record_anonymous_usage(db, "evaluate_reason", x_anonymous_client_id, x_client_version, authorization, request)
     return EvaluationReasonResponse(evaluation_reason=reason)
 
 
 @app.post("/title", response_model=TitleResponse)
-def recommend_title(data: TitleRequest):
+def recommend_title(
+    data: TitleRequest,
+    request: Request,
+    authorization: str = Header(default=""),
+    x_anonymous_client_id: str = Header(default=""),
+    x_client_version: str = Header(default=""),
+    db: Session = Depends(get_db),
+):
     if not data.text.strip():
         raise HTTPException(status_code=400, detail="제목을 추천할 텍스트가 비어 있습니다.")
 
@@ -635,11 +820,19 @@ def recommend_title(data: TitleRequest):
 
     elapsed_ms = int((time.monotonic() - started_at) * 1000)
     log_ai_request("done", "title", model=service.model, elapsed_ms=elapsed_ms, output_chars=len(title_text))
+    record_anonymous_usage(db, "title", x_anonymous_client_id, x_client_version, authorization, request)
     return TitleResponse(title_text=title_text)
 
 
 @app.post("/summary", response_model=SummaryResponse)
-def summarize_text(data: SummaryRequest):
+def summarize_text(
+    data: SummaryRequest,
+    request: Request,
+    authorization: str = Header(default=""),
+    x_anonymous_client_id: str = Header(default=""),
+    x_client_version: str = Header(default=""),
+    db: Session = Depends(get_db),
+):
     if not data.text.strip():
         raise HTTPException(status_code=400, detail="요약할 텍스트가 비어 있습니다.")
 
@@ -661,11 +854,19 @@ def summarize_text(data: SummaryRequest):
 
     elapsed_ms = int((time.monotonic() - started_at) * 1000)
     log_ai_request("done", "summary", model=service.model, elapsed_ms=elapsed_ms, output_chars=len(summary_text))
+    record_anonymous_usage(db, "summary", x_anonymous_client_id, x_client_version, authorization, request)
     return SummaryResponse(summary_text=summary_text)
 
 
 @app.post("/tone", response_model=ToneResponse)
-def change_tone(data: ToneRequest):
+def change_tone(
+    data: ToneRequest,
+    request: Request,
+    authorization: str = Header(default=""),
+    x_anonymous_client_id: str = Header(default=""),
+    x_client_version: str = Header(default=""),
+    db: Session = Depends(get_db),
+):
     if not data.text.strip():
         raise HTTPException(status_code=400, detail="문체/말투를 바꿀 텍스트가 비어 있습니다.")
     if not data.tone.strip():
@@ -683,6 +884,7 @@ def change_tone(data: ToneRequest):
 
     elapsed_ms = int((time.monotonic() - started_at) * 1000)
     log_ai_request("done", "tone", model=service.model, elapsed_ms=elapsed_ms, output_chars=len(changed_text))
+    record_anonymous_usage(db, "tone", x_anonymous_client_id, x_client_version, authorization, request)
     return ToneResponse(changed_text=changed_text)
 
 

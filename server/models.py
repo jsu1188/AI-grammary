@@ -102,3 +102,14 @@ class UserSetting(Base):
     input_mode = Column(String(20), nullable=False, default="clipboard")
     replace_mode = Column(Boolean, nullable=False, default=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AnonymousUsageEvent(Base):
+    __tablename__ = "anonymous_usage_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    anonymous_client_id = Column(String(80), nullable=False, index=True)
+    feature = Column(String(40), nullable=False, index=True)
+    app_version = Column(String(40), nullable=True)
+    ip_address = Column(String(80), nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
