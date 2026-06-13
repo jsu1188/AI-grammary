@@ -138,26 +138,45 @@ class OutputApplier:
             if word_range is None:
                 return style_info
             if word_range.End > word_range.Start:
-                word_range.End = word_range.End - 1
+                try:
+                    last_character = document.Range(
+                        Start=int(word_range.End) - 1,
+                        End=int(word_range.End),
+                    ).Text
+                except Exception:
+                    last_character = ""
+                if last_character in {"\r", "\x07"}:
+                    word_range.End = word_range.End - 1
             char_count = max(0, int(getattr(word_range, "End", 0)) - int(getattr(word_range, "Start", 0)))
             self._log_word_replace(f"Word style refresh start chars={char_count}")
-            segments = self._capture_word_openxml_style_segments(word_range)
+            current_source_text = self._normalize_text(
+                str(getattr(word_range, "Text", "") or "").replace("\x07", "")
+            )
+            # Use OpenXML only to find run boundaries, then read effective COM
+            # formatting once per run. This preserves inherited styles without
+            # making one slow COM call for every character.
+            segments = self._capture_word_effective_style_runs(word_range, current_source_text)
+            capture_mode = "com_effective_runs"
+            if not segments:
+                segments = self._capture_word_style_segments(word_range)
+                capture_mode = "com_effective_chars_fallback"
             if not segments:
                 base_style = self._capture_word_style(word_range)
                 if base_style:
-                    source_len = len(str(source_text or ""))
+                    source_len = len(current_source_text)
                     segments = [{"start": 0, "end": source_len, "style": base_style}]
+                    capture_mode = "single_style_fallback"
             if segments:
                 style_info["segments"] = segments
                 self._log_word_replace(
                     f"Word style runs refreshed before mapping count={len(segments)} "
-                    f"selection={bool(style_info.get('selection_mode'))}"
+                    f"selection={bool(style_info.get('selection_mode'))} capture={capture_mode}"
                 )
-            if source_text:
+            if current_source_text:
                 if style_info.get("selection_mode"):
-                    style_info["selection_text"] = str(source_text)
+                    style_info["selection_text"] = current_source_text
                 else:
-                    style_info["_source_text"] = str(source_text)
+                    style_info["_source_text"] = current_source_text
             return style_info
         except Exception as exc:
             self._log_word_replace(f"Word style refresh failed: {type(exc).__name__}: {exc}")
@@ -334,21 +353,7 @@ class OutputApplier:
         if target.mode == "hwp":
             self._focus_window(target.window_handle)
             if (target.style_info or {}).get("selection_mode"):
-                preserve_style = bool((target.style_info or {}).get("segments_mapped") or (target.style_info or {}).get("segments"))
-                has_mapped_segments = bool((target.style_info or {}).get("segments_mapped") and (target.style_info or {}).get("segments"))
-                if (target.style_info or {}).get("hwp_selection_start_pos"):
-                    self._apply_to_active_hwp(text, target.style_info, target.window_handle)
-                    return
-                if has_mapped_segments:
-                    self._apply_to_active_hwp(text, target.style_info, target.window_handle)
-                    return
-                if preserve_style:
-                    raise RuntimeError("HWP style-preserving replacement requires saved selection bounds.")
-                self._apply_to_hwp_via_keyboard_once(target.window_handle, text, selection_mode=True)
-                self._log_hwp_replace(
-                    f"applied selected HWP via one-shot keyboard length={len(text)} "
-                    f"read_method={(target.style_info or {}).get('read_method')!r}"
-                )
+                self._apply_to_hwp_selected_block(text, target.style_info or {}, target.window_handle)
                 return
             try:
                 self._apply_to_active_hwp(text, target.style_info, target.window_handle)
@@ -361,16 +366,10 @@ class OutputApplier:
             except Exception as com_exc:
                 self._log_hwp_replace(f"COM apply failed: {type(com_exc).__name__}: {com_exc}")
                 if (target.style_info or {}).get("selection_mode"):
-                    preserve_style = bool((target.style_info or {}).get("segments_mapped") or (target.style_info or {}).get("segments"))
-                    if preserve_style:
-                        raise RuntimeError(
-                            "HWP style-preserving replacement failed before fallback. "
-                            f"COM: {com_exc}"
-                        ) from com_exc
                     try:
-                        self._apply_to_hwp_via_keyboard_once(target.window_handle, text, selection_mode=True)
+                        self._apply_to_hwp_selected_block(text, target.style_info or {}, target.window_handle)
                         self._log_hwp_replace(
-                            f"applied selected HWP via one-shot keyboard length={len(text)} "
+                            f"applied selected HWP via direct selected-block path length={len(text)} "
                             f"read_method={(target.style_info or {}).get('read_method')!r}"
                         )
                         return
@@ -556,15 +555,21 @@ class OutputApplier:
                 word_range = getattr(selection, "Range", None) if selection is not None else None
             if word_range is None:
                 raise RuntimeError("No active Word selection is available.")
+            if style_info.get("segments_mapped") and (style_info.get("segments") or []):
+                if self._apply_word_mapped_text_to_original_runs(
+                    document,
+                    word_range,
+                    style_info.get("segments") or [],
+                ):
+                    return
+                raise RuntimeError(
+                    "Word replacement was stopped because the original style-run ranges "
+                    "could not be preserved safely."
+                )
             if self._apply_word_openxml_replacement(word_range, text):
                 return
             if self._apply_word_paragraph_text_replacement(word_range, text):
                 return
-            if style_info.get("segments_mapped") and (style_info.get("segments") or []):
-                raise RuntimeError(
-                    "Word style-preserving replacement failed before fallback. "
-                    "RTF fallback was blocked because it does not preserve Word paragraph/layout styles."
-                )
             replacement_text = self._word_text_for_write(text)
             replacement_start = int(getattr(word_range, "Start", 0))
             captured_style = self._capture_word_style(word_range)
@@ -589,6 +594,91 @@ class OutputApplier:
         else:
             self._apply_word_style(document.Content, style_info)
         self._apply_word_style_segments(document, style_info.get("segments") or [])
+
+    def _apply_word_mapped_text_to_original_runs(
+        self,
+        document,
+        selection_range,
+        mapped_segments: list[dict],
+    ) -> bool:
+        try:
+            selection_start = int(getattr(selection_range, "Start", 0))
+            selection_end = int(getattr(selection_range, "End", 0))
+        except Exception:
+            return False
+
+        jobs: list[dict] = []
+        for segment in mapped_segments[:800]:
+            try:
+                source_start = int(segment.get("source_start"))
+                source_end = int(segment.get("source_end"))
+            except Exception:
+                return False
+            if source_start < 0 or source_end < source_start:
+                return False
+            mapped_text = segment.get("text")
+            source_text = segment.get("source_text")
+            if not isinstance(mapped_text, str):
+                return False
+            if not isinstance(source_text, str):
+                source_text = ""
+            absolute_start = selection_start + source_start
+            absolute_end = selection_start + source_end
+            if absolute_start < selection_start or absolute_end > selection_end:
+                self._log_word_replace(
+                    "word original-run replacement skipped: source range escaped selection "
+                    f"relative=({source_start},{source_end}) selection=({selection_start},{selection_end})"
+                )
+                return False
+            try:
+                current_text = str(
+                    document.Range(Start=absolute_start, End=absolute_end).Text or ""
+                )
+            except Exception:
+                return False
+            if self._normalize_text(current_text) != self._normalize_text(source_text):
+                self._log_word_replace(
+                    "word original-run replacement skipped: active text no longer matches source "
+                    f"relative=({source_start},{source_end}) "
+                    f"current={current_text[:40]!r} source={source_text[:40]!r}"
+                )
+                return False
+            jobs.append(
+                {
+                    "absolute_start": absolute_start,
+                    "absolute_end": absolute_end,
+                    "source_text": source_text,
+                    "mapped_text": mapped_text,
+                }
+            )
+
+        if not jobs:
+            return False
+
+        try:
+            changed = 0
+            # Work backwards so changing a later run cannot shift earlier ranges.
+            for job in reversed(jobs):
+                source_text = str(job["source_text"])
+                mapped_text = str(job["mapped_text"])
+                if self._normalize_text(source_text) == self._normalize_text(mapped_text):
+                    continue
+                run_range = document.Range(
+                    Start=int(job["absolute_start"]),
+                    End=int(job["absolute_end"]),
+                )
+                run_range.Text = self._word_text_for_write(mapped_text)
+                changed += 1
+            self._log_word_replace(
+                f"word original-run replacement success runs={len(jobs)} changed={changed} "
+                f"selection=({selection_start},{selection_end})"
+            )
+            return True
+        except Exception as exc:
+            self._log_word_replace(
+                f"word original-run replacement failed: {type(exc).__name__}: {exc}"
+            )
+            return False
 
     def _apply_word_openxml_replacement(self, word_range, replacement_text: str) -> bool:
         try:
@@ -640,10 +730,10 @@ class OutputApplier:
                 continue
             if end > start:
                 end -= 1  # keep the paragraph mark, so paragraph formatting survives
-            if index - 1 < len(replacement_lines):
-                line_text = replacement_lines[index - 1]
-            elif index == paragraph_count and len(replacement_lines) > paragraph_count:
+            if index == paragraph_count and len(replacement_lines) > paragraph_count:
                 line_text = "\n".join(replacement_lines[index - 1 :])
+            elif index - 1 < len(replacement_lines):
+                line_text = replacement_lines[index - 1]
             else:
                 line_text = ""
             paragraph_jobs.append((start, end, line_text))
@@ -667,6 +757,127 @@ class OutputApplier:
         except Exception as exc:
             self._log_word_replace(f"word paragraph replacement failed: {type(exc).__name__}: {exc}")
             return False
+
+    def _apply_word_selection_preserving_layout(
+        self,
+        word_range,
+        replacement_text: str,
+        mapped_segments: list[dict],
+    ) -> bool:
+        try:
+            paragraphs = word_range.Paragraphs
+            paragraph_count = int(paragraphs.Count)
+            document = getattr(word_range, "Document", None)
+        except Exception as exc:
+            self._log_word_replace(
+                f"word layout replacement skipped: paragraphs unavailable {type(exc).__name__}: {exc}"
+            )
+            return False
+        if document is None or paragraph_count <= 0:
+            return False
+
+        replacement_lines = self._normalize_text(replacement_text).split("\n")
+        if not replacement_lines:
+            replacement_lines = [""]
+
+        jobs: list[dict] = []
+        global_cursor = 0
+        for index in range(1, paragraph_count + 1):
+            try:
+                paragraph_range = paragraphs.Item(index).Range.Duplicate
+                start = int(getattr(paragraph_range, "Start", 0))
+                end = int(getattr(paragraph_range, "End", 0))
+            except Exception:
+                continue
+            if end > start:
+                end -= 1  # keep Word's paragraph mark, numbering, alignment and paragraph style intact
+
+            if index == paragraph_count and len(replacement_lines) > paragraph_count:
+                line_text = "\n".join(replacement_lines[index - 1 :])
+            elif index - 1 < len(replacement_lines):
+                line_text = replacement_lines[index - 1]
+            else:
+                line_text = ""
+
+            line_start = global_cursor
+            line_end = line_start + len(line_text)
+            jobs.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "text": line_text,
+                    "line_start": line_start,
+                    "line_end": line_end,
+                }
+            )
+            global_cursor = line_end
+            if index < paragraph_count:
+                global_cursor += 1
+
+        if not jobs:
+            return False
+
+        try:
+            # Replace from bottom to top so saved paragraph starts above the edit remain stable.
+            for job in reversed(jobs):
+                start = int(job["start"])
+                end = int(job["end"])
+                line_text = str(job["text"])
+                target_range = document.Range(Start=start, End=end)
+                target_range.Text = self._word_text_for_write(line_text).replace("\r", "\v")
+                self._apply_word_styles_inside_paragraph(
+                    document,
+                    start,
+                    line_text,
+                    int(job["line_start"]),
+                    int(job["line_end"]),
+                    mapped_segments,
+                )
+            self._log_word_replace(
+                f"word layout replacement success paragraphs={len(jobs)} "
+                f"segments={len(mapped_segments)} text_len={len(str(replacement_text or ''))}"
+            )
+            return True
+        except Exception as exc:
+            self._log_word_replace(f"word layout replacement failed: {type(exc).__name__}: {exc}")
+            return False
+
+    def _apply_word_styles_inside_paragraph(
+        self,
+        document,
+        paragraph_start: int,
+        paragraph_text: str,
+        global_start: int,
+        global_end: int,
+        mapped_segments: list[dict],
+    ):
+        if not paragraph_text or global_end <= global_start:
+            return
+        paragraph_length = len(paragraph_text)
+        for segment in mapped_segments[:800]:
+            try:
+                segment_start = int(segment.get("start", 0))
+                segment_end = int(segment.get("end", 0))
+            except Exception:
+                continue
+            overlap_start = max(global_start, segment_start)
+            overlap_end = min(global_end, segment_end)
+            if overlap_end <= overlap_start:
+                continue
+            local_start = max(0, min(paragraph_length, overlap_start - global_start))
+            local_end = max(0, min(paragraph_length, overlap_end - global_start))
+            if local_end <= local_start:
+                continue
+            try:
+                style_range = document.Range(
+                    Start=paragraph_start + local_start,
+                    End=paragraph_start + local_end,
+                )
+                self._apply_word_style(style_range, segment.get("style") or {})
+            except Exception as exc:
+                self._log_word_replace(
+                    f"word paragraph segment style failed: {type(exc).__name__}: {exc}"
+                )
 
     def _build_word_openxml_text_replacement(self, source_xml: str, replacement_text: str) -> str:
         try:
@@ -1043,6 +1254,59 @@ class OutputApplier:
             segments.append({"start": segment_start, "end": text_index, "style": dict(current_style)})
         return segments
 
+    def _capture_word_effective_style_runs(self, word_range, expected_text: str) -> list[dict]:
+        try:
+            root = ET.fromstring(getattr(word_range, "WordOpenXML", "") or "")
+            document = getattr(word_range, "Document", None)
+            base_start = int(getattr(word_range, "Start", 0))
+        except Exception:
+            return []
+        if document is None:
+            return []
+
+        namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        paragraphs = root.findall(".//w:body/w:p", namespace)
+        spans: list[tuple[int, int]] = []
+        text_index = 0
+        for paragraph_index, paragraph in enumerate(paragraphs):
+            for run in paragraph.findall(".//w:r", namespace):
+                run_start = text_index
+                for part_text, is_break in self._word_openxml_run_text_parts(run):
+                    text_index += 1 if is_break else len(part_text)
+                if text_index > run_start:
+                    spans.append((run_start, text_index))
+            if paragraph_index < len(paragraphs) - 1:
+                spans.append((text_index, text_index + 1))
+                text_index += 1
+
+        expected_length = len(self._normalize_text(expected_text))
+        if text_index != expected_length:
+            self._log_word_replace(
+                f"Word run capture fallback: xml_chars={text_index} expected_chars={expected_length}"
+            )
+            return []
+
+        segments: list[dict] = []
+        for start, end in spans:
+            if end <= start:
+                continue
+            try:
+                run_range = document.Range(Start=base_start + start, End=base_start + end)
+                style = self._capture_word_style(run_range)
+            except Exception:
+                continue
+            if not style:
+                continue
+            signature = tuple(sorted(style.items()))
+            if segments:
+                previous = segments[-1]
+                previous_signature = tuple(sorted((previous.get("style") or {}).items()))
+                if previous.get("end") == start and previous_signature == signature:
+                    previous["end"] = end
+                    continue
+            segments.append({"start": start, "end": end, "style": style})
+        return segments
+
     def _capture_word_openxml_style_segments(self, word_range) -> list[dict]:
         try:
             root = ET.fromstring(getattr(word_range, "WordOpenXML", "") or "")
@@ -1097,6 +1361,9 @@ class OutputApplier:
     def _word_openxml_run_style(self, run, namespace) -> dict:
         run_props = run.find("w:rPr", namespace)
         style = {
+            "font_name": None,
+            "font_name_far_east": None,
+            "font_size": None,
             "bold": False,
             "italic": False,
             "underline": 0,
@@ -1104,13 +1371,42 @@ class OutputApplier:
             "double_strike_through": False,
             "subscript": False,
             "superscript": False,
+            "all_caps": False,
+            "small_caps": False,
+            "hidden": False,
+            "emboss": False,
+            "engrave": False,
+            "shadow": False,
+            "outline": False,
+            "spacing": None,
+            "position": None,
+            "kerning": None,
             "highlight_color_index": 0,
             "color_hex": "#000000",
         }
         if run_props is None:
             return style
+        fonts = run_props.find("w:rFonts", namespace)
+        if fonts is not None:
+            ascii_font = self._word_openxml_attr(fonts, "ascii") or self._word_openxml_attr(fonts, "hAnsi")
+            east_asian_font = self._word_openxml_attr(fonts, "eastAsia")
+            if ascii_font:
+                style["font_name"] = ascii_font
+            if east_asian_font:
+                style["font_name_far_east"] = east_asian_font
+        size = run_props.find("w:sz", namespace)
+        size_value = self._word_openxml_half_points(size)
+        if size_value is not None:
+            style["font_size"] = size_value
         style["bold"] = self._word_openxml_toggle_enabled(run_props.find("w:b", namespace))
         style["italic"] = self._word_openxml_toggle_enabled(run_props.find("w:i", namespace))
+        style["all_caps"] = self._word_openxml_toggle_enabled(run_props.find("w:caps", namespace))
+        style["small_caps"] = self._word_openxml_toggle_enabled(run_props.find("w:smallCaps", namespace))
+        style["hidden"] = self._word_openxml_toggle_enabled(run_props.find("w:vanish", namespace))
+        style["emboss"] = self._word_openxml_toggle_enabled(run_props.find("w:emboss", namespace))
+        style["engrave"] = self._word_openxml_toggle_enabled(run_props.find("w:imprint", namespace))
+        style["shadow"] = self._word_openxml_toggle_enabled(run_props.find("w:shadow", namespace))
+        style["outline"] = self._word_openxml_toggle_enabled(run_props.find("w:outline", namespace))
         underline = run_props.find("w:u", namespace)
         if underline is not None:
             underline_value = self._word_openxml_attr(underline, "val") or "single"
@@ -1130,6 +1426,15 @@ class OutputApplier:
             style["subscript"] = True
         elif vertical_value == "superscript":
             style["superscript"] = True
+        spacing = self._word_openxml_twentieths(run_props.find("w:spacing", namespace))
+        if spacing is not None:
+            style["spacing"] = spacing
+        position = self._word_openxml_half_points(run_props.find("w:position", namespace))
+        if position is not None:
+            style["position"] = position
+        kerning = self._word_openxml_half_points(run_props.find("w:kern", namespace))
+        if kerning is not None:
+            style["kerning"] = kerning
         highlight = run_props.find("w:highlight", namespace)
         if highlight is not None:
             highlight_value = self._word_openxml_attr(highlight, "val")
@@ -1141,6 +1446,24 @@ class OutputApplier:
             if color_hex:
                 style["color_hex"] = color_hex
         return style
+
+    def _word_openxml_half_points(self, element):
+        value = self._word_openxml_attr(element, "val") if element is not None else None
+        if value is None:
+            return None
+        try:
+            return float(value) / 2
+        except Exception:
+            return None
+
+    def _word_openxml_twentieths(self, element):
+        value = self._word_openxml_attr(element, "val") if element is not None else None
+        if value is None:
+            return None
+        try:
+            return float(value) / 20
+        except Exception:
+            return None
 
     def _word_openxml_attr(self, element, name: str):
         if element is None:
@@ -1197,16 +1520,39 @@ class OutputApplier:
             return
         assignments = {
             "font_name": "Name",
+            "font_name_far_east": "NameFarEast",
             "font_size": "Size",
+            "font_size_bi": "SizeBi",
             "bold": "Bold",
             "italic": "Italic",
+            "all_caps": "AllCaps",
+            "small_caps": "SmallCaps",
+            "hidden": "Hidden",
+            "emboss": "Emboss",
+            "engrave": "Engrave",
+            "shadow": "Shadow",
+            "outline": "Outline",
+            "scaling": "Scaling",
+            "spacing": "Spacing",
+            "position": "Position",
+            "kerning": "Kerning",
         }
         for key, attr in assignments.items():
             value = style_info.get(key)
             if value is None:
                 continue
             try:
-                if key in {"bold", "italic"}:
+                if key in {
+                    "bold",
+                    "italic",
+                    "all_caps",
+                    "small_caps",
+                    "hidden",
+                    "emboss",
+                    "engrave",
+                    "shadow",
+                    "outline",
+                }:
                     value = -1 if bool(value) else 0
                 setattr(font, attr, value)
             except Exception:
@@ -1255,12 +1601,28 @@ class OutputApplier:
                 word_range.HighlightColorIndex = highlight_value
             except Exception:
                 pass
-        color_value = self._word_color_from_hex(style_info.get("color_hex"))
-        if color_value is not None:
+        theme_color = self._clean_word_mixed_value(style_info.get("theme_color"))
+        try:
+            theme_color_number = int(theme_color) if theme_color is not None else 0
+        except Exception:
+            theme_color_number = 0
+        theme_applied = False
+        if theme_color_number > 0:
             try:
-                font.Color = color_value
+                font.ThemeColor = theme_color_number
+                theme_tint = style_info.get("theme_tint_and_shade")
+                if theme_tint is not None:
+                    font.ThemeTintAndShade = float(theme_tint)
+                theme_applied = True
             except Exception:
                 pass
+        if not theme_applied:
+            color_value = self._word_color_from_hex(style_info.get("color_hex"))
+            if color_value is not None:
+                try:
+                    font.Color = color_value
+                except Exception:
+                    pass
 
         underline_color = style_info.get("underline_color")
         if underline_color is None:
@@ -1270,6 +1632,45 @@ class OutputApplier:
                 font.UnderlineColor = int(underline_color)
             except Exception:
                 pass
+        shading_color = self._clean_word_mixed_value(style_info.get("shading_background_color"))
+        if shading_color is not None:
+            try:
+                word_range.Shading.BackgroundPatternColor = int(shading_color)
+            except Exception:
+                pass
+        try:
+            paragraph = word_range.ParagraphFormat
+        except Exception:
+            paragraph = None
+        if paragraph is not None:
+            paragraph_assignments = {
+                "paragraph_alignment": "Alignment",
+                "paragraph_left_indent": "LeftIndent",
+                "paragraph_right_indent": "RightIndent",
+                "paragraph_first_line_indent": "FirstLineIndent",
+                "paragraph_space_before": "SpaceBefore",
+                "paragraph_space_after": "SpaceAfter",
+                "paragraph_line_spacing": "LineSpacing",
+            }
+            for key, attr in paragraph_assignments.items():
+                value = self._clean_word_mixed_value(style_info.get(key))
+                if value is None:
+                    continue
+                try:
+                    setattr(paragraph, attr, value)
+                except Exception:
+                    pass
+            for key, attr in (
+                ("paragraph_keep_with_next", "KeepWithNext"),
+                ("paragraph_keep_together", "KeepTogether"),
+            ):
+                value = style_info.get(key)
+                if value is None:
+                    continue
+                try:
+                    setattr(paragraph, attr, -1 if bool(value) else 0)
+                except Exception:
+                    pass
 
     def _word_highlight_value(self, value):
         if value is None:
@@ -1371,6 +1772,49 @@ class OutputApplier:
                 return
         self._apply_hwp_plain_text_replacement(hwp, text)
 
+    def _apply_to_hwp_selected_block(self, text: str, style_info: dict, window_handle: int | None = None):
+        if pythoncom is None:
+            raise RuntimeError("pywin32 is required for HWP replacement.")
+        pythoncom.CoInitialize()
+        hwp = self._active_hwp_object(window_handle)
+        if hwp is None:
+            raise RuntimeError("No active HWP COM object is available.")
+
+        expected_text = str(
+            (style_info or {}).get("selection_text")
+            or (style_info or {}).get("_source_text")
+            or ""
+        )
+        if expected_text:
+            selected_xml = self._get_hwp_textfile(hwp, "HWPML2X", "saveblock")
+            selected_text = self._extract_hwpml2x_plain_text(selected_xml)
+            if not selected_text:
+                self._log_hwp_replace("HWP selected-block replace blocked: active saveblock is empty")
+                raise RuntimeError(
+                    "HWP selected replacement was blocked because the active selected block could not be verified."
+                )
+            if not self._selection_text_matches_expected(selected_text, expected_text):
+                self._log_hwp_replace(
+                    "HWP selected-block replace blocked: active saveblock does not match saved selection "
+                    f"captured_len={len(self._normalize_text(selected_text).strip())} "
+                    f"expected_len={len(self._normalize_text(expected_text).strip())}"
+                )
+                raise RuntimeError(
+                    "HWP selected replacement was blocked because the active selected block changed."
+                )
+
+        mapped_segments = (style_info or {}).get("segments") or []
+        if (style_info or {}).get("segments_mapped") and mapped_segments:
+            if self._apply_hwp_selected_rtf_replacement(text, mapped_segments):
+                self._log_hwp_replace(
+                    f"HWP selected-block RTF replacement committed runs={len(mapped_segments)} length={len(text)}"
+                )
+                return
+            raise RuntimeError("HWP selected style-preserving replacement failed.")
+
+        self._apply_to_hwp_via_keyboard_once(window_handle, text, selection_mode=True)
+        self._log_hwp_replace(f"HWP selected-block plain replacement committed length={len(text)}")
+
     def _refresh_hwp_selection_style_info(self, hwp, style_info: dict) -> dict:
         refreshed = dict(style_info or {})
         self._diagnose_hwp_textfile_formats(hwp)
@@ -1440,7 +1884,9 @@ class OutputApplier:
             return {}
         style = {
             "font_name": self._clean_word_mixed_value(getattr(font, "Name", None)),
+            "font_name_far_east": self._clean_word_mixed_value(getattr(font, "NameFarEast", None)),
             "font_size": self._clean_word_mixed_value(getattr(font, "Size", None)),
+            "font_size_bi": self._clean_word_mixed_value(getattr(font, "SizeBi", None)),
             "bold": self._word_bool(getattr(font, "Bold", None)),
             "italic": self._word_bool(getattr(font, "Italic", None)),
             "underline": self._clean_word_mixed_value(getattr(font, "Underline", None)),
@@ -1448,11 +1894,78 @@ class OutputApplier:
             "double_strike_through": self._word_bool(getattr(font, "DoubleStrikeThrough", None)),
             "subscript": self._word_bool(getattr(font, "Subscript", None)),
             "superscript": self._word_bool(getattr(font, "Superscript", None)),
+            "all_caps": self._word_bool(getattr(font, "AllCaps", None)),
+            "small_caps": self._word_bool(getattr(font, "SmallCaps", None)),
+            "hidden": self._word_bool(getattr(font, "Hidden", None)),
+            "emboss": self._word_bool(getattr(font, "Emboss", None)),
+            "engrave": self._word_bool(getattr(font, "Engrave", None)),
+            "shadow": self._word_bool(getattr(font, "Shadow", None)),
+            "outline": self._word_bool(getattr(font, "Outline", None)),
+            "scaling": self._clean_word_mixed_value(getattr(font, "Scaling", None)),
+            "spacing": self._clean_word_mixed_value(getattr(font, "Spacing", None)),
+            "position": self._clean_word_mixed_value(getattr(font, "Position", None)),
+            "kerning": self._clean_word_mixed_value(getattr(font, "Kerning", None)),
             "highlight_color_index": self._clean_word_mixed_value(
                 getattr(word_range, "HighlightColorIndex", None)
             ),
             "underline_color": self._clean_word_mixed_value(getattr(font, "UnderlineColor", None)),
+            "color_raw": self._clean_word_mixed_value(getattr(font, "Color", None)),
+            "color_index": self._clean_word_mixed_value(getattr(font, "ColorIndex", None)),
+            "theme_color": self._clean_word_mixed_value(getattr(font, "ThemeColor", None)),
+            "theme_tint_and_shade": self._clean_word_mixed_value(
+                getattr(font, "ThemeTintAndShade", None)
+            ),
         }
+        try:
+            paragraph = word_range.ParagraphFormat
+            style.update(
+                {
+                    "paragraph_alignment": self._clean_word_mixed_value(
+                        getattr(paragraph, "Alignment", None)
+                    ),
+                    "paragraph_left_indent": self._clean_word_mixed_value(
+                        getattr(paragraph, "LeftIndent", None)
+                    ),
+                    "paragraph_right_indent": self._clean_word_mixed_value(
+                        getattr(paragraph, "RightIndent", None)
+                    ),
+                    "paragraph_first_line_indent": self._clean_word_mixed_value(
+                        getattr(paragraph, "FirstLineIndent", None)
+                    ),
+                    "paragraph_space_before": self._clean_word_mixed_value(
+                        getattr(paragraph, "SpaceBefore", None)
+                    ),
+                    "paragraph_space_after": self._clean_word_mixed_value(
+                        getattr(paragraph, "SpaceAfter", None)
+                    ),
+                    "paragraph_line_spacing": self._clean_word_mixed_value(
+                        getattr(paragraph, "LineSpacing", None)
+                    ),
+                    "paragraph_keep_with_next": self._word_bool(
+                        getattr(paragraph, "KeepWithNext", None)
+                    ),
+                    "paragraph_keep_together": self._word_bool(
+                        getattr(paragraph, "KeepTogether", None)
+                    ),
+                }
+            )
+        except Exception:
+            pass
+        try:
+            shading = getattr(word_range, "Shading", None)
+            if shading is not None:
+                style["shading_background_color"] = self._clean_word_mixed_value(
+                    getattr(shading, "BackgroundPatternColor", None)
+                )
+        except Exception:
+            pass
+        try:
+            style_obj = getattr(word_range, "Style", None)
+            style_name = getattr(style_obj, "NameLocal", None) if style_obj is not None else None
+            if style_name:
+                style["character_style_name"] = str(style_name)
+        except Exception:
+            pass
         color = self._clean_word_mixed_value(getattr(font, "Color", None))
         if color is not None:
             try:
@@ -1986,6 +2499,10 @@ class OutputApplier:
     def _apply_hwp_saved_selection_replacement(self, hwp, replacement_text: str, style_info: dict):
         mapped_segments = style_info.get("segments") or []
         if style_info.get("segments_mapped") and mapped_segments:
+            if not style_info.get("hwp_selection_start_pos"):
+                raise RuntimeError(
+                    "HWP style-preserving replacement requires saved selection bounds."
+                )
             if self._apply_hwp_saved_selection_segmented_replacement(
                 hwp,
                 replacement_text,
@@ -1995,26 +2512,13 @@ class OutputApplier:
                     "HWP selected replacement committed via block-scoped HWPML2X"
                 )
                 return
-            if style_info.get("hwp_selection_start_pos"):
-                raise RuntimeError(
-                    "HWP selected block replacement was stopped because its paragraph structure "
-                    "could not be preserved safely."
-                )
-            if self._apply_hwp_selected_rtf_replacement(replacement_text, mapped_segments):
-                self._log_hwp_replace("HWP selected replacement committed via RTF clipboard")
-                return
             self._log_hwp_replace(
-                "HWP selected RTF replacement failed; falling back to text plus style replay"
+                "HWP selected rich replacement unavailable; falling back to plain selected-text replacement"
             )
         # Do not use HWPML2X SetTextFile for selected ranges. In HWP it can
         # report a text match while replacing content outside the user's block.
         self._apply_hwp_selected_text_replacement(hwp, replacement_text)
-        if style_info.get("segments_mapped") and mapped_segments:
-            self._restore_hwp_selection_style(hwp, style_info, replacement_text)
-        elif self._can_restore_selection_style_safely(style_info, replacement_text):
-            self._restore_hwp_selection_style(hwp, style_info, replacement_text)
-        else:
-            self._log_hwp_replace("HWP selection style restore skipped by safety guard")
+        self._log_hwp_replace("HWP selection style restore skipped to avoid unstable COM style replay")
 
     def _apply_hwp_full_document_via_selection_mode(
         self,
@@ -2153,6 +2657,8 @@ class OutputApplier:
                 continue
             controls: list[str] = []
             controls.append("\\plain")
+            if style_mode == "word" and (start == 0 or text[start - 1 : start] == "\n"):
+                controls.extend(self._word_rtf_paragraph_controls(style))
             font_name = str(style.get("font_name") or "").strip()
             controls.append(f"\\f{font_index.get(font_name, 0)}")
             font_size = self._safe_hwp_float(style.get("font_size"))
@@ -2171,6 +2677,39 @@ class OutputApplier:
                 controls.append("\\strike")
             body.append("{" + "".join(controls) + " " + self._rtf_escape_text(chunk) + "}")
         return "{\\rtf1\\ansi\\deff0" + font_table + color_table + "\\viewkind4\\uc1 " + "".join(body) + "}"
+
+    def _word_rtf_paragraph_controls(self, style: dict) -> list[str]:
+        controls: list[str] = []
+        try:
+            alignment = int(style.get("paragraph_alignment"))
+        except Exception:
+            alignment = None
+        alignment_control = {
+            0: "\\ql",
+            1: "\\qc",
+            2: "\\qr",
+            3: "\\qj",
+            4: "\\qd",
+        }.get(alignment)
+        if alignment_control:
+            controls.append(alignment_control)
+
+        for key, control in (
+            ("paragraph_left_indent", "\\li"),
+            ("paragraph_right_indent", "\\ri"),
+            ("paragraph_first_line_indent", "\\fi"),
+            ("paragraph_space_before", "\\sb"),
+            ("paragraph_space_after", "\\sa"),
+            ("paragraph_line_spacing", "\\sl"),
+        ):
+            value = self._safe_hwp_float(style.get(key))
+            if value is not None:
+                controls.append(f"{control}{int(round(value * 20))}")
+        if style.get("paragraph_keep_with_next"):
+            controls.append("\\keepn")
+        if style.get("paragraph_keep_together"):
+            controls.append("\\keep")
+        return controls
 
     def _style_runs_for_rich_clipboard(
         self,
@@ -2754,7 +3293,24 @@ class OutputApplier:
                             target_styles[dst_index] = source_styles[src_index]
                     continue
                 if tag == "replace":
-                    common = min(i2 - i1, j2 - j1)
+                    src_count = max(0, i2 - i1)
+                    dst_count = max(0, j2 - j1)
+                    if preserve_word_style and src_count > 0 and dst_count > 0:
+                        # Word selection style preservation is visual: when text
+                        # changes length, spread the original selected style pattern
+                        # across the corrected text instead of letting one nearby
+                        # style absorb the whole replacement.
+                        for offset in range(dst_count):
+                            if dst_count == 1 or src_count == 1:
+                                local_src = i1
+                            else:
+                                local_src = i1 + round(offset * (src_count - 1) / (dst_count - 1))
+                            src_index = src_offset + min(i2 - 1, max(i1, local_src))
+                            dst_index = dst_offset + j1 + offset
+                            if 0 <= src_index < source_len and 0 <= dst_index < len(target_styles):
+                                target_styles[dst_index] = source_styles[src_index]
+                        continue
+                    common = min(src_count, dst_count)
                     for offset in range(common):
                         src_index = src_offset + i1 + offset
                         dst_index = dst_offset + j1 + offset
@@ -2873,8 +3429,9 @@ class OutputApplier:
         if not callable(setter):
             self._log_hwp_replace("HWP segmented replacement skipped: SetTextFile unavailable")
             return False
-        # Only use explicit block-aware options for a saved selection.
-        for option in ("saveblock", "selection"):
+        # Only use saveblock here. Some HWP builds report success for
+        # option="selection" while replacing content outside the selected block.
+        for option in ("saveblock",):
             for call_variant in ("three_args", "two_args"):
                 try:
                     self._select_hwp_text_range(hwp, start_pos, end_pos, length)

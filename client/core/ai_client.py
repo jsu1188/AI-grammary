@@ -60,6 +60,10 @@ class AIClient:
                 "style_runs": payload_runs,
             },
             timeout=120,
+            debug_context={
+                "style_runs_with_style": style_runs or [],
+                "note": "Local Word style data. This field is saved only in api_debug and is not sent to the API.",
+            },
         )
         return data.get("mapped_runs", []) or []
 
@@ -115,7 +119,7 @@ class AIClient:
         source_text = prompt.split("\n", 1)[1] if "\n" in prompt else prompt
         return self.correct_spelling(source_text)
 
-    def _post(self, path, payload, timeout=60):
+    def _post(self, path, payload, timeout=60, debug_context=None):
         self.local_server.ensure_running()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename = f"{timestamp}_{path.strip('/').replace('/', '_')}.json"
@@ -128,6 +132,8 @@ class AIClient:
             "response": None,
             "error": None,
         }
+        if debug_context:
+            debug_data["local_debug"] = self._json_safe_debug_value(debug_context)
         try:
             response = requests.post(
                 f"{self.base_url}{path}",
@@ -141,6 +147,7 @@ class AIClient:
                 debug_data["response"] = response.text
             response.raise_for_status()
             result = response.json()
+            self._attach_style_map_debug_result(path, debug_data, result)
             self._write_debug_snapshot(debug_path, debug_data)
             return result
         except requests.HTTPError as exc:
@@ -158,7 +165,48 @@ class AIClient:
             raise RuntimeError(f"OpenAI 요청 통신 실패: {exc}") from exc
 
     def _write_debug_snapshot(self, path: Path, data: dict):
+        if path.name.endswith("_style-map.json"):
+            return
         try:
             path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
+
+    def _attach_style_map_debug_result(self, path, debug_data, result):
+        if path != "/style-map":
+            return
+        local_debug = debug_data.get("local_debug")
+        if not isinstance(local_debug, dict):
+            return
+        source_runs = local_debug.get("style_runs_with_style")
+        mapped_runs = result.get("mapped_runs") if isinstance(result, dict) else None
+        if not isinstance(source_runs, list) or not isinstance(mapped_runs, list):
+            return
+        combined = []
+        for index, source_run in enumerate(source_runs):
+            source_item = source_run if isinstance(source_run, dict) else {}
+            mapped_item = mapped_runs[index] if index < len(mapped_runs) else {}
+            mapped_text = mapped_item.get("text") if isinstance(mapped_item, dict) else ""
+            combined.append(
+                {
+                    "index": index,
+                    "source_start": source_item.get("start"),
+                    "source_end": source_item.get("end"),
+                    "source_text": source_item.get("text", ""),
+                    "mapped_text": mapped_text if isinstance(mapped_text, str) else "",
+                    "style": source_item.get("style") or {},
+                }
+            )
+        local_debug["mapped_runs_with_style"] = self._json_safe_debug_value(combined)
+
+    def _json_safe_debug_value(self, value):
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, dict):
+            return {
+                str(key): self._json_safe_debug_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [self._json_safe_debug_value(item) for item in value]
+        return str(value)

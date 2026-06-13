@@ -1560,23 +1560,41 @@ class App:
             if prepared_style_info:
                 target.style_info = dict(prepared_style_info)
                 style_info = target.style_info
-            mapped_runs = self.get_output_applier().remap_word_segments(
-                style_info,
+                source_text = str(style_info.get("selection_text") or source_text)
+            local_runs = self._enrich_style_runs_with_source_text(
+                source_text,
+                style_info.get("segments") or [],
+            )
+            if not local_runs:
+                return {"status": "failed", "reason": "word_style_runs_empty"}
+            mapped_text_runs = self.analyzer.map_style_runs(
                 source_text,
                 str(corrected_text or ""),
+                local_runs,
+            )
+            mapped_runs = self._merge_mapped_text_with_local_styles(
+                str(corrected_text or ""),
+                local_runs,
+                mapped_text_runs,
+                source_text,
             )
             if not mapped_runs:
-                return {"status": "failed", "reason": "word_local_style_map_failed"}
+                return {"status": "failed", "reason": "word_api_style_map_failed"}
+            mapped_corrected_text = self._rebuild_text_from_mapped_runs(
+                str(corrected_text or ""),
+                mapped_runs,
+            )
             target.style_info = dict(style_info)
             target.style_info["segments"] = mapped_runs
             target.style_info["segments_mapped"] = True
-            target.style_info["mapping_mode"] = "word_local_sequence_map"
+            target.style_info["mapping_mode"] = "word_api_style_map"
             return {
                 "status": "ok",
                 "source_chars": len(source_text),
                 "corrected_chars": len(str(corrected_text or "")),
-                "input_runs": len(style_info.get("segments") or []),
+                "input_runs": len(local_runs),
                 "mapped_runs": len(mapped_runs),
+                "mapped_corrected_text": mapped_corrected_text,
             }
 
         if target.mode == "hwp":
@@ -1685,6 +1703,9 @@ class App:
                 {
                     "start": start,
                     "end": end,
+                    "source_start": local_run.get("start"),
+                    "source_end": local_run.get("end"),
+                    "source_text": local_run.get("text", ""),
                     "style": style,
                     "text": run_text,
                 }
@@ -1708,6 +1729,9 @@ class App:
                 {
                     "start": sep_start,
                     "end": sep_end,
+                    "source_start": current_end,
+                    "source_end": next_start,
+                    "source_text": separator,
                     "style": {},
                     "text": normalized_separator,
                 }
